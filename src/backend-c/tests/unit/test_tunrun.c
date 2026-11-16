@@ -3297,6 +3297,44 @@ TEST an_event_on_another_tunnel_s_device_is_not_a_network_change(void)
     PASS();
 }
 
+static void *stack_budget_worker(void *ud)
+{
+    firc_tunrun_t *run = ud;
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        return (void *)1;
+    }
+    size_t n = firc_tunrun_states(run, st, FIRC_TUN_MAX);
+    bool down = firc_tunrun_device_down(run, "tunvless0");
+    int64_t since = -1;
+    bool starting = firc_tunrun_device_starting(run, "tunvless0", &since);
+    free(st);
+    (void)n;
+    (void)down;
+    (void)starting;
+    return NULL;
+}
+
+TEST tunrun_states_and_device_checks_fit_inside_128k_musl_stack(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 1, 2000));
+
+    pthread_attr_t attr;
+    ASSERT_EQ(0, pthread_attr_init(&attr));
+    ASSERT_EQ(0, pthread_attr_setstacksize(&attr, 128 * 1024));
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, &attr, stack_budget_worker, f.run));
+    void *ret = NULL;
+    ASSERT_EQ(0, pthread_join(th, &ret));
+    ASSERT_EQ(NULL, ret);
+    pthread_attr_destroy(&attr);
+    fx_down(&f);
+    PASS();
+}
+
 SUITE(tunrun)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -3399,6 +3437,7 @@ SUITE(tunrun)
     RUN_TEST(an_event_with_no_name_is_a_network_change);
     RUN_TEST(an_event_on_a_tunnel_s_own_device_is_not_a_network_change);
     RUN_TEST(an_event_on_another_tunnel_s_device_is_not_a_network_change);
+    RUN_TEST(tunrun_states_and_device_checks_fit_inside_128k_musl_stack);
 }
 
 typedef enum { FR_MANUAL, FR_READY, FR_PRESENT_ONLY, FR_REFUSE_REMOVAL } fr_mode_t;
