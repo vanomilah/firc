@@ -125,6 +125,83 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
     return h2_start_req(h, io, &r);
 }
 
+static void c_wb(struct wbuf *b, const void *d, size_t n) {
+    if (b->n + n <= b->cap) memcpy(b->p + b->n, d, n);
+    b->n += n;
+}
+static void c_wb8(struct wbuf *b, unsigned v) {
+    unsigned char c = (unsigned char)v;
+    c_wb(b, &c, 1);
+}
+static void c_hp_int(struct wbuf *b, unsigned prefix, unsigned bits, uint32_t v) {
+    uint32_t max = (1u << bits) - 1;
+    if (v < max) { c_wb8(b, prefix | v); return; }
+    c_wb8(b, prefix | max);
+    v -= max;
+    while (v >= 128) { c_wb8(b, (v & 0x7F) | 0x80); v >>= 7; }
+    c_wb8(b, v);
+}
+static void c_hp_str(struct wbuf *b, const char *s, size_t n) {
+    c_hp_int(b, 0x00, 7, (uint32_t)n);
+    c_wb(b, s, n);
+}
+static void c_hp_field(struct wbuf *b, unsigned name_index, const char *value) {
+    c_hp_int(b, 0x00, 4, name_index);
+    c_hp_str(b, value, strlen(value));
+}
+static void c_hp_new(struct wbuf *b, const char *name, const char *value) {
+    c_wb8(b, 0x00);
+    c_hp_str(b, name, strlen(name));
+    c_hp_str(b, value, strlen(value));
+}
+
+static void c_hp_noindex(struct wbuf *b, const char *name, const char *value, size_t vlen) {
+    c_wb8(b, 0x10);
+    c_hp_str(b, name, strlen(name));
+    c_hp_str(b, value, vlen);
+}
+
+int h2_start_connect(struct h2 *h, const struct h2_io *io, const char *authority,
+                     const char *proxy_auth, const char *user_agent, int end_stream) {
+    memset(h, 0, sizeof(*h));
+    h->io = *io;
+    h->sid = 1;
+    h->send_win = 65535;
+    h->send_win_conn = 65535;
+    h->peer_init_win = 65535;
+
+    struct h2_scratch *s = scratch();
+    if (!s) return H2_EIO;
+    struct wbuf b = { s->req_out, 0, sizeof s->req_out };
+    b.n = h2w_preface(s->req_out, sizeof s->req_out, 1);
+    {
+        unsigned char hb[2048];
+        struct wbuf hp = { hb, 0, sizeof(hb) };
+        /* RFC 7540 §8.3: CONNECT has ONLY :method and :authority pseudo-headers (:scheme and :path
+         * MUST be omitted). Static table: 2 = :method, 1 = :authority, 58 = user-agent. */
+        c_hp_field(&hp, 2, "CONNECT");
+        c_hp_field(&hp, 1, authority ? authority : "");
+        if (proxy_auth && proxy_auth[0]) c_hp_new(&hp, "proxy-authorization", proxy_auth);
+        if (user_agent && user_agent[0]) {
+            c_hp_field(&hp, 58, user_agent);
+            if (!strncmp(user_agent, "Chrome/", 7)) {
+                static const char npad[] = "0123456789abcdef0123456789abcdef";
+                c_hp_noindex(&hp, "padding", npad, sizeof(npad) - 1);
+            }
+        }
+        if (hp.n > sizeof(hb)) return H2_ETOOBIG;
+
+        unsigned char hdr[9];
+        h2w_frame_hdr(hdr, (uint32_t)hp.n, FR_HEADERS,
+                      (unsigned char)(FLAG_END_HEADERS | (end_stream ? FLAG_END_STREAM : 0)), h->sid);
+        c_wb(&b, hdr, 9);
+        c_wb(&b, hb, hp.n);
+    }
+    if (b.n > sizeof s->req_out) return H2_ETOOBIG;
+    h->started = 1;
+    return h->io.write(h->io.ctx, s->req_out, b.n);
+}
+
 /* Refills the receive windows when enough has accumulated. Both levels: connection and stream
  * are counted apart, and forgetting one stalls at its limit. */
 static int window_refill(struct h2 *h) {

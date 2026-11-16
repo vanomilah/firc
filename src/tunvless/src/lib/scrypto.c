@@ -276,6 +276,49 @@ int sc_hkdf(enum sc_hash h, const void *salt, size_t salt_n, const void *ikm, si
     return rc;
 }
 
+int sc_pbkdf2_sha256(const void *pass, size_t pass_n, const void *salt, size_t salt_n,
+                     int iter, unsigned char *out, size_t out_n) {
+    if (iter < 1 || !out || !out_n || pass_n > UINT32_MAX || salt_n > UINT32_MAX) return SC_EINVAL;
+    Hmac *m = malloc(sizeof(*m));
+    if (!m) return SC_ENOMEM;
+    static const unsigned char nokey[1];
+    int rc = wc_HmacInit(m, NULL, INVALID_DEVID);
+    if (rc != 0) { free(m); return SC_ECRYPTO; }
+    uint32_t blk = 1;
+    size_t pos = 0;
+    unsigned char u[32], t[32];
+    while (pos < out_n) {
+        unsigned char be4[4] = {
+            (unsigned char)(blk >> 24), (unsigned char)(blk >> 16),
+            (unsigned char)(blk >> 8),  (unsigned char)blk
+        };
+        rc = wc_HmacSetKey(m, WC_SHA256, pass_n ? pass : nokey, (word32)pass_n);
+        if (rc == 0 && salt_n) rc = wc_HmacUpdate(m, salt, (word32)salt_n);
+        if (rc == 0) rc = wc_HmacUpdate(m, be4, 4);
+        if (rc == 0) rc = wc_HmacFinal(m, u);
+        if (rc != 0) break;
+        memcpy(t, u, 32);
+        for (int i = 1; i < iter; i++) {
+            rc = wc_HmacSetKey(m, WC_SHA256, pass_n ? pass : nokey, (word32)pass_n);
+            if (rc == 0) rc = wc_HmacUpdate(m, u, 32);
+            if (rc == 0) rc = wc_HmacFinal(m, u);
+            if (rc != 0) break;
+            for (int j = 0; j < 32; j++) t[j] ^= u[j];
+        }
+        if (rc != 0) break;
+        size_t take = out_n - pos < 32 ? out_n - pos : 32;
+        memcpy(out + pos, t, take);
+        pos += take;
+        blk++;
+    }
+    wc_ForceZero(u, sizeof(u));
+    wc_ForceZero(t, sizeof(t));
+    wc_HmacFree(m);
+    wc_ForceZero(m, sizeof(*m));
+    free(m);
+    return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
 /* ---- AEAD ----------------------------------------------------------------------------------- */
 
 size_t sc_aead_key_len(enum sc_aead_alg a) {
@@ -351,6 +394,183 @@ int sc_aead_open(struct sc_aead *k, const unsigned char nonce[12],
         return SC_EINVAL;
     }
     return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
+static inline uint32_t hcc_rotl32(uint32_t v, int c) { return (v << c) | (v >> (32 - c)); }
+static inline uint32_t hcc_le32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline void hcc_put_le32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
+}
+#define HCC_QR(a, b, c, d) do { \
+    (a) += (b); (d) ^= (a); (d) = hcc_rotl32((d), 16); \
+    (c) += (d); (b) ^= (c); (b) = hcc_rotl32((b), 12); \
+    (a) += (b); (d) ^= (a); (d) = hcc_rotl32((d), 8);  \
+    (c) += (d); (b) ^= (c); (b) = hcc_rotl32((b), 7);  \
+} while (0)
+
+static void hchacha20(const unsigned char key[32], const unsigned char nonce16[16],
+                      unsigned char subkey[32]) {
+    uint32_t x[16] = {
+        0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
+        hcc_le32(key + 0),  hcc_le32(key + 4),  hcc_le32(key + 8),  hcc_le32(key + 12),
+        hcc_le32(key + 16), hcc_le32(key + 20), hcc_le32(key + 24), hcc_le32(key + 28),
+        hcc_le32(nonce16 + 0), hcc_le32(nonce16 + 4), hcc_le32(nonce16 + 8), hcc_le32(nonce16 + 12)
+    };
+    for (int i = 0; i < 10; i++) {
+        HCC_QR(x[0], x[4], x[8],  x[12]);
+        HCC_QR(x[1], x[5], x[9],  x[13]);
+        HCC_QR(x[2], x[6], x[10], x[14]);
+        HCC_QR(x[3], x[7], x[11], x[15]);
+        HCC_QR(x[0], x[5], x[10], x[15]);
+        HCC_QR(x[1], x[6], x[11], x[12]);
+        HCC_QR(x[2], x[7], x[8],  x[13]);
+        HCC_QR(x[3], x[4], x[9],  x[14]);
+    }
+    for (int i = 0; i < 4; i++) hcc_put_le32(subkey + i * 4, x[i]);
+    for (int i = 0; i < 4; i++) hcc_put_le32(subkey + 16 + i * 4, x[12 + i]);
+    wc_ForceZero(x, sizeof(x));
+}
+
+int sc_xchacha20_poly1305_seal(const unsigned char key[32], const unsigned char nonce[24],
+                               const void *aad, size_t aad_n, unsigned char *buf, size_t n,
+                               unsigned char tag[16]) {
+    unsigned char subkey[32], subnonce[12] = {0};
+    hchacha20(key, nonce, subkey);
+    memcpy(subnonce + 4, nonce + 16, 8);
+    struct sc_aead a;
+    int rc = sc_aead_setkey(&a, SC_CHACHA20_POLY1305, subkey);
+    if (rc == 0) rc = sc_aead_seal(&a, subnonce, aad, aad_n, buf, n, tag);
+    sc_aead_free(&a);
+    wc_ForceZero(subkey, sizeof(subkey));
+    return rc;
+}
+
+int sc_xchacha20_poly1305_open(const unsigned char key[32], const unsigned char nonce[24],
+                               const void *aad, size_t aad_n, unsigned char *buf, size_t n,
+                               const unsigned char tag[16]) {
+    unsigned char subkey[32], subnonce[12] = {0};
+    hchacha20(key, nonce, subkey);
+    memcpy(subnonce + 4, nonce + 16, 8);
+    struct sc_aead a;
+    int rc = sc_aead_setkey(&a, SC_CHACHA20_POLY1305, subkey);
+    if (rc == 0) rc = sc_aead_open(&a, subnonce, aad, aad_n, buf, n, tag);
+    sc_aead_free(&a);
+    wc_ForceZero(subkey, sizeof(subkey));
+    return rc;
+}
+
+int sc_chacha20_hp(const unsigned char key[32], const unsigned char sample[16],
+                   unsigned char mask[5]) {
+    if (!key || !sample || !mask) return SC_EINVAL;
+    uint32_t init[16] = {
+        0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
+        hcc_le32(key + 0),     hcc_le32(key + 4),     hcc_le32(key + 8),     hcc_le32(key + 12),
+        hcc_le32(key + 16),    hcc_le32(key + 20),    hcc_le32(key + 24),    hcc_le32(key + 28),
+        hcc_le32(sample + 0),  hcc_le32(sample + 4),  hcc_le32(sample + 8),  hcc_le32(sample + 12)
+    };
+    uint32_t x[16];
+    memcpy(x, init, sizeof(x));
+    for (int i = 0; i < 10; i++) {
+        HCC_QR(x[0], x[4], x[8],  x[12]);
+        HCC_QR(x[1], x[5], x[9],  x[13]);
+        HCC_QR(x[2], x[6], x[10], x[14]);
+        HCC_QR(x[3], x[7], x[11], x[15]);
+        HCC_QR(x[0], x[5], x[10], x[15]);
+        HCC_QR(x[1], x[6], x[11], x[12]);
+        HCC_QR(x[2], x[7], x[8],  x[13]);
+        HCC_QR(x[3], x[4], x[9],  x[14]);
+    }
+    unsigned char blk[8];
+    hcc_put_le32(blk + 0, x[0] + init[0]);
+    hcc_put_le32(blk + 4, x[1] + init[1]);
+    memcpy(mask, blk, 5);
+    wc_ForceZero(x, sizeof(x));
+    wc_ForceZero(init, sizeof(init));
+    return 0;
+}
+
+/* ---- BLAKE2b-256 (RFC 7693) ----------------------------------------------------------------- */
+
+static const uint64_t b2b_iv[8] = {
+    0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+    0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+    0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+};
+
+static const uint8_t b2b_sigma[12][16] = {
+    {  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+    { 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
+    {  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
+    {  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
+    {  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
+    { 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
+    { 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
+    {  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
+    { 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
+    {  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 }
+};
+
+static inline uint64_t b2b_rotr64(uint64_t w, int c) { return (w >> c) | (w << (64 - c)); }
+static inline uint64_t b2b_le64(const unsigned char *p) {
+    return (uint64_t)hcc_le32(p) | ((uint64_t)hcc_le32(p + 4) << 32);
+}
+
+#define B2B_G(v, a, b, c, d, x, y) do { \
+    (v)[a] = (v)[a] + (v)[b] + (x); (v)[d] = b2b_rotr64((v)[d] ^ (v)[a], 32); \
+    (v)[c] = (v)[c] + (v)[d];       (v)[b] = b2b_rotr64((v)[b] ^ (v)[c], 24); \
+    (v)[a] = (v)[a] + (v)[b] + (y); (v)[d] = b2b_rotr64((v)[d] ^ (v)[a], 16); \
+    (v)[c] = (v)[c] + (v)[d];       (v)[b] = b2b_rotr64((v)[b] ^ (v)[c], 63); \
+} while (0)
+
+static void b2b_compress(uint64_t h[8], const unsigned char block[128], uint64_t t0, int last) {
+    uint64_t v[16], m[16];
+    for (int i = 0; i < 16; i++) m[i] = b2b_le64(block + i * 8);
+    for (int i = 0; i < 8; i++)  v[i] = h[i];
+    for (int i = 0; i < 8; i++)  v[i + 8] = b2b_iv[i];
+    v[12] ^= t0;
+    if (last) v[14] = ~v[14];
+    for (int r = 0; r < 12; r++) {
+        const uint8_t *s = b2b_sigma[r];
+        B2B_G(v, 0, 4,  8, 12, m[s[ 0]], m[s[ 1]]);
+        B2B_G(v, 1, 5,  9, 13, m[s[ 2]], m[s[ 3]]);
+        B2B_G(v, 2, 6, 10, 14, m[s[ 4]], m[s[ 5]]);
+        B2B_G(v, 3, 7, 11, 15, m[s[ 6]], m[s[ 7]]);
+        B2B_G(v, 0, 5, 10, 15, m[s[ 8]], m[s[ 9]]);
+        B2B_G(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        B2B_G(v, 2, 7,  8, 13, m[s[12]], m[s[13]]);
+        B2B_G(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
+    }
+    for (int i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i + 8];
+}
+
+void sc_blake2b_256(unsigned char out[32], const void *in, size_t n) {
+    uint64_t h[8];
+    for (int i = 0; i < 8; i++) h[i] = b2b_iv[i];
+    h[0] ^= 0x01010020ULL;
+    const unsigned char *p = (const unsigned char *)in;
+    uint64_t t0 = 0;
+    while (n > 128) {
+        t0 += 128;
+        b2b_compress(h, p, t0, 0);
+        p += 128;
+        n -= 128;
+    }
+    unsigned char blk[128] = {0};
+    if (n > 0) memcpy(blk, p, n);
+    t0 += (uint64_t)n;
+    b2b_compress(h, blk, t0, 1);
+    for (int i = 0; i < 4; i++) {
+        hcc_put_le32(out + i * 8,     (uint32_t)h[i]);
+        hcc_put_le32(out + i * 8 + 4, (uint32_t)(h[i] >> 32));
+    }
+    wc_ForceZero(blk, sizeof(blk));
+    wc_ForceZero(h, sizeof(h));
 }
 
 /* ---- AES-256-CTR ---------------------------------------------------------------------------- */

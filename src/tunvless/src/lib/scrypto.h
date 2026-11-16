@@ -88,6 +88,10 @@ int sc_hkdf_expand(enum sc_hash h, const void *prk, size_t prk_n,
 int sc_hkdf(enum sc_hash h, const void *salt, size_t salt_n, const void *ikm, size_t ikm_n,
             const void *info, size_t info_n, unsigned char *out, size_t out_n);
 
+/* PBKDF2-HMAC-SHA256 (RFC 8018 §5.2). */
+int sc_pbkdf2_sha256(const void *pass, size_t pass_n, const void *salt, size_t salt_n,
+                     int iter, unsigned char *out, size_t out_n);
+
 /* ---- AEAD --------------------------------------------------------------------------------- */
 
 enum sc_aead_alg { SC_AES128_GCM = 1, SC_AES256_GCM = 2, SC_CHACHA20_POLY1305 = 3 };
@@ -114,6 +118,22 @@ int sc_aead_seal(struct sc_aead *k, const unsigned char nonce[12],
 int sc_aead_open(struct sc_aead *k, const unsigned char nonce[12],
                  const void *aad, size_t aad_n, unsigned char *buf, size_t n,
                  const unsigned char tag[16]);
+
+/* XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha): 32-byte key, 24-byte nonce, 16-byte tag. */
+int sc_xchacha20_poly1305_seal(const unsigned char key[32], const unsigned char nonce[24],
+                               const void *aad, size_t aad_n, unsigned char *buf, size_t n,
+                               unsigned char tag[16]);
+int sc_xchacha20_poly1305_open(const unsigned char key[32], const unsigned char nonce[24],
+                               const void *aad, size_t aad_n, unsigned char *buf, size_t n,
+                               const unsigned char tag[16]);
+
+/* ChaCha20 QUIC header protection (RFC 9001 §5.4.4): sample[0..3] is LE32 counter,
+ * sample[4..15] is 12-byte nonce, outputs 5-byte mask. */
+int sc_chacha20_hp(const unsigned char key[32], const unsigned char sample[16],
+                   unsigned char mask[5]);
+
+/* BLAKE2b-256 (RFC 7693): unkeyed 32-byte digest (used by Hysteria2 Salamander obfuscation). */
+void sc_blake2b_256(unsigned char out[32], const void *in, size_t n);
 
 /* ---- AES-256-CTR -------------------------------------------------------------------------- */
 
