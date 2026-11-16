@@ -39,4 +39,22 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
 
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip);
 
+/* TrustTunnel (HTTP/2 CONNECT) and SOCKS5 framing helpers. */
+size_t tt_basic_auth(const char *userpass, char *out, size_t cap);
+size_t tt_build_connect(const char *userpass, const char *authority,
+                        const char *user_agent, int end_stream,
+                        unsigned char *out, size_t cap);
+
+size_t socks5_build_connect(const char *host, const unsigned char ip4[4],
+                            uint16_t port, unsigned char *out, size_t cap);
+int socks5_parse_reply(const unsigned char *buf, size_t n, size_t *skip);
+
+/* Trojan (SHA-224 hex password + SOCKS5 address + CRLF) and Shadowsocks address helpers. */
+void trojan_sha224_hex(const char *password, char out[57]);
+size_t trojan_build_request(const char *password, uint8_t cmd,
+                            const char *host, const unsigned char ip4[4],
+                            uint16_t port, unsigned char *out, size_t cap);
+size_t ss_build_addr(const char *host, const unsigned char ip4[4],
+                     uint16_t port, unsigned char *out, size_t cap);
+
 #endif

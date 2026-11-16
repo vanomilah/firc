@@ -24,16 +24,72 @@
 #include "client.h"
 #include "sublink.h"
 
-int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
-    struct tr_node tn, td;
-    sl_tr_nodes(node, &tn, &td);
-    return transport_open(conn, &tn, timeout_s);
-}
-
 static int64_t now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static int socks5_read_exact(struct transport *c, unsigned char *out, size_t need, int timeout_s) {
+    size_t have = 0;
+    int64_t deadline = now_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
+    while (have < need) {
+        size_t got = 0;
+        int rc = transport_read(c, out + have, need - have, &got);
+        if (rc) return rc;
+        have += got;
+        if (have >= need) return 0;
+        if (now_ms() >= deadline) return TR_EIO;
+        struct pollfd pw = { .fd = transport_fd(c), .events = POLLIN, .revents = 0 };
+        poll(&pw, 1, 200);
+    }
+    return 0;
+}
+
+static int socks5_handshake(const struct vless_node *node, struct transport *c, int timeout_s) {
+    unsigned char greet[4] = { 0x05, node->uuid[0] ? 0x02 : 0x01, 0x00, 0x02 };
+    int rc = transport_write(c, greet, node->uuid[0] ? 4 : 3);
+    if (rc) return rc;
+    unsigned char rep[2];
+    rc = socks5_read_exact(c, rep, 2, timeout_s);
+    if (rc) return rc;
+    if (rep[0] != 0x05) return VLESS_CONN_EREJECTED;
+    if (rep[1] == 0x02) {
+        const char *colon = strchr(node->uuid, ':');
+        size_t ulen = colon ? (size_t)(colon - node->uuid) : strlen(node->uuid);
+        const char *pass = colon ? colon + 1 : "";
+        size_t plen = strlen(pass);
+        if (ulen > 255 || plen > 255) return VLESS_CONN_EREJECTED;
+        unsigned char auth[3 + 255 + 255];
+        auth[0] = 0x01;
+        auth[1] = (unsigned char)ulen;
+        if (ulen) memcpy(auth + 2, node->uuid, ulen);
+        auth[2 + ulen] = (unsigned char)plen;
+        if (plen) memcpy(auth + 3 + ulen, pass, plen);
+        rc = transport_write(c, auth, 3 + ulen + plen);
+        if (rc) return rc;
+        rc = socks5_read_exact(c, rep, 2, timeout_s);
+        if (rc) return rc;
+        if (rep[0] != 0x01 || rep[1] != 0x00) return VLESS_CONN_EREJECTED;
+        return 0;
+    }
+    if (rep[1] != 0x00) return VLESS_CONN_EREJECTED;
+    return 0;
+}
+
+int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
+    struct tr_node tn, td;
+    sl_tr_nodes(node, &tn, &td);
+    int rc = transport_open(conn, &tn, timeout_s);
+    if (rc) return rc;
+    if (!strcmp(node->proto, "socks5")) {
+        rc = socks5_handshake(node, conn, timeout_s);
+        if (rc) {
+            transport_close(conn);
+            return rc;
+        }
+    }
+    return 0;
 }
 
 /* The node check: the only way to learn whether Reality accepted us.
@@ -111,30 +167,86 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
     if (handshake_ms) *handshake_ms = (int)(now_ms() - t0);
     *connected = 1;
 
+    int is_tt = !strcmp(node->proto, "tt");
+    int is_naive = !strcmp(node->proto, "naive");
+    int is_socks = !strcmp(node->proto, "socks5");
+    int is_trojan = !strcmp(node->proto, "trojan");
+    int is_ss = !strcmp(node->proto, "ss");
+    int is_vmess = !strcmp(node->proto, "vmess");
+    int is_mieru = !strcmp(node->proto, "mieru");
+    int is_hy2 = !strcmp(node->proto, "hy2");
+    int is_anytls = !strcmp(node->proto, "anytls");
     unsigned char uuid[16];
-    if (vless_uuid_parse(node->uuid, uuid) != 0) {
-        transport_close(&c);
-        snprintf(why, why_n, "bad UUID");
-        return VLESS_CONN_EBADUUID;
-    }
-
     unsigned char req[512];
-    size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, tg->ip, tg->ip_len, 80,
-                                       node->flow, req, sizeof(req));
-    if (!req_n) { transport_close(&c); snprintf(why, why_n, "cannot build the request header"); return TR_EIO; }
-
-    /* A minimal HTTP request goes with the header: the server does not answer until it has
-     * data to forward, and without it the probe would wait for the timeout. */
-    char http[128];
-    int http_n = snprintf(http, sizeof(http),
-                          "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
-    /* How much data actually follows the header. Vision below subtracts exactly this to split
-     * the VLESS header from the data, and the HTTP request may not have fit. */
+    size_t req_n = 0;
     size_t http_used = 0;
-    if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
-        memcpy(req + req_n, http, (size_t)http_n);
-        req_n += (size_t)http_n;
-        http_used = (size_t)http_n;
+
+    if (is_tt) {
+        req_n = tt_build_connect(node->uuid, "_check", "TrustTunnel-Client/1.0", 1,
+                                 req, sizeof(req));
+        if (!req_n) {
+            transport_close(&c);
+            snprintf(why, why_n, "cannot build the TrustTunnel CONNECT header");
+            return TR_EIO;
+        }
+    } else if (is_naive) {
+        char auth[64];
+        snprintf(auth, sizeof(auth), "%s:80", tg->host);
+        req_n = tt_build_connect(node->uuid, auth, "Chrome/128.0.0.0", 0, req, sizeof(req));
+        if (!req_n) {
+            transport_close(&c);
+            snprintf(why, why_n, "cannot build the Naive CONNECT header");
+            return TR_EIO;
+        }
+        char http[128];
+        int http_n = snprintf(http, sizeof(http),
+                              "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+        if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
+            memcpy(req + req_n, http, (size_t)http_n);
+            req_n += (size_t)http_n;
+        }
+    } else if (is_socks || is_mieru || is_trojan || is_ss || is_vmess || is_hy2 || is_anytls) {
+        if (is_socks || is_mieru)
+            req_n = socks5_build_connect(tg->ip_len == 4 ? NULL : tg->host, tg->ip, 80, req, sizeof(req));
+        else if (is_trojan)
+            req_n = trojan_build_request(node->uuid, 0x01, tg->ip_len == 4 ? NULL : tg->host, tg->ip, 80, req, sizeof(req));
+        else
+            req_n = ss_build_addr(tg->ip_len == 4 ? NULL : tg->host, tg->ip, 80, req, sizeof(req));
+        if (!req_n) {
+            transport_close(&c);
+            snprintf(why, why_n, "cannot build the request header");
+            return TR_EIO;
+        }
+        char http[128];
+        int http_n = snprintf(http, sizeof(http),
+                              "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+        if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
+            memcpy(req + req_n, http, (size_t)http_n);
+            req_n += (size_t)http_n;
+        }
+    } else {
+        if (vless_uuid_parse(node->uuid, uuid) != 0) {
+            transport_close(&c);
+            snprintf(why, why_n, "bad UUID");
+            return VLESS_CONN_EBADUUID;
+        }
+
+        req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, tg->ip, (int)tg->ip_len, 80,
+                                    node->flow, req, sizeof(req));
+        if (!req_n) { transport_close(&c); snprintf(why, why_n, "cannot build the request header"); return TR_EIO; }
+
+        /* A minimal HTTP request goes with the header: the server does not answer until it has
+         * data to forward, and without it the probe would wait for the timeout. */
+        char http[128];
+        int http_n = snprintf(http, sizeof(http),
+                              "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+        /* How much data actually follows the header. Vision below subtracts exactly this to split
+         * the VLESS header from the data, and the HTTP request may not have fit. */
+        if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
+            memcpy(req + req_n, http, (size_t)http_n);
+            req_n += (size_t)http_n;
+            http_used = (size_t)http_n;
+        }
     }
 
     /* With Vision the VLESS header goes raw, immediately followed by the first Vision frame
@@ -189,7 +301,14 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
             size_t take = got < sizeof(head) - head_n ? got : sizeof(head) - head_n;
             memcpy(head + head_n, buf, take);
             head_n += take;
-            if (pr == VLESS_EAGAIN) pr = vless_parse_response(head, head_n, &skip);
+            if (pr == VLESS_EAGAIN) {
+                if (is_socks || is_mieru)
+                    pr = socks5_parse_reply(head, head_n, &skip);
+                else if (is_trojan || is_ss || is_vmess || is_hy2 || is_anytls)
+                    pr = (head_n >= 5 && !memcmp(head, "HTTP/", 5)) ? 0 : (head_n < 5 ? VLESS_EAGAIN : VLESS_EPROTO);
+                else
+                    pr = vless_parse_response(head, head_n, &skip);
+            }
             if (pr == VLESS_EPROTO || (pr == 0 && (!need_data || total > skip))) break;
             continue;
         }

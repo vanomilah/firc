@@ -20,6 +20,7 @@
 /* vless_proto.c holds the UUID derivation: a panel link must both pass the usability check in
  * sub.c and give the 16 bytes that go into the request header. */
 #include "../src/proto/vless/vless_proto.c"
+#include "../src/proto/vless/vlink.c"
 
 static int g_pass, g_fail;
 
@@ -1606,7 +1607,7 @@ int main(void) {
     {
         struct vless_node nodes[8];
         struct vless_sub_stats st;
-        size_t n = vless_parse_sub("vless://a@h1:443#one" "anytls://p@h2:443#two",
+        size_t n = vless_parse_sub("vless://a@h1:443#one" "unkproto://p@h2:443#two",
                                    nodes, 8, &st);
         check_n("unknown scheme: node with a foreign tail not taken", 0, (long)n);
         check_n("unknown scheme: link counted as unusable", 1, (long)st.skipped);
@@ -1663,7 +1664,7 @@ int main(void) {
         int k = snprintf(big, sizeof(big), "vless://u@h:443?sni=");
         memset(big + k, 'x', 9000);
         k += 9000;
-        k += snprintf(big + k, sizeof(big) - (size_t)k, "#one" "anytls://p@h2:443#two");
+        k += snprintf(big + k, sizeof(big) - (size_t)k, "#one" "unkproto://p@h2:443#two");
         big[k] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
         check_n("long glue: node not taken", 0, (long)n);
@@ -1709,7 +1710,7 @@ int main(void) {
             "vless://b@[2001:db8::1:443?security=reality&pbk=K&sni=x.com#ipv6\n"
             "vless://c@5.6.7.8:0?security=reality&pbk=K&sni=x.com#zero-port\n"
             "vless://d@9.9.9.9:443?security=tls#tls\n"
-            "hy2://e@10.0.0.1:443#foreign\n";
+            "tuic://e@10.0.0.1:443#foreign\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
         check_n("arithmetic: usable nodes", 1, (long)n);
         check_n("arithmetic: foreign links", 1, (long)st.foreign);
@@ -2729,6 +2730,206 @@ int main(void) {
     t_dl_all();
     t_xmux_all();
     t_fm_all();
+
+    /* ---- TrustTunnel (tt:// and TLV connect-URL) & SOCKS5 (socks5://) -------- */
+    {
+        struct vless_node n;
+        char link[512];
+        check_n("tt:// canonical link: usable", 0,
+                vless_parse_url("tt://alice:secret123@tt.example.com:8443?sni=cover.example.com&record_fragment=1&allow_insecure=1#MyTT", &n));
+        check("tt:// proto", "tt", n.proto);
+        check("tt:// uuid (user:pass)", "alice:secret123", n.uuid);
+        check("tt:// host", "tt.example.com", n.host);
+        check_n("tt:// port", 8443, (int)n.port);
+        check("tt:// sni", "cover.example.com", n.sni);
+        check_n("tt:// record_fragment", 1, (int)n.record_fragment);
+        check_n("tt:// allow_insecure sets insecure=1", 1, (int)n.insecure);
+        check("tt:// name", "MyTT", n.name);
+        vless_node_link(&n, link, sizeof(link));
+        check("tt:// roundtrip link",
+              "tt://alice:secret123@tt.example.com:8443?type=tcp&security=tls&sni=cover.example.com&record_fragment=1&allowInsecure=1#MyTT",
+              link);
+
+        check_n("socks5:// link with user:pass: usable", 0,
+                vless_parse_url("socks5://bob:pw%401@127.0.0.1:1080#LocalSocks", &n));
+        check("socks5:// proto", "socks5", n.proto);
+        check("socks5:// uuid", "bob:pw@1", n.uuid);
+        check("socks5:// host", "127.0.0.1", n.host);
+        check_n("socks5:// port", 1080, (int)n.port);
+        check("socks5:// name", "LocalSocks", n.name);
+        vless_node_link(&n, link, sizeof(link));
+        check("socks5:// roundtrip link", "socks5://bob:pw%401@127.0.0.1:1080#LocalSocks", link);
+
+        char auth[128];
+        tt_basic_auth("alice:secret123", auth, sizeof(auth));
+        check("tt_basic_auth header", "Basic YWxpY2U6c2VjcmV0MTIz", auth);
+
+        char sha224[57];
+        trojan_sha224_hex("abc", sha224);
+        check("trojan_sha224_hex NIST 'abc' vector",
+              "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7", sha224);
+
+        check_n("trojan:// link: usable", 0,
+                vless_parse_url("trojan://my_secret_pw@trojan.example.com:443?sni=trojan.example.com#TrojanNode", &n));
+        check("trojan:// proto", "trojan", n.proto);
+        check("trojan:// uuid (password)", "my_secret_pw", n.uuid);
+        check("trojan:// security defaults to tls", "tls", n.security);
+
+        check_n("ss:// SIP002 base64 link: usable", 0,
+                vless_parse_url("ss://YWVzLTI1Ni1nY206c2VjcmV0MTIz@ss.example.com:8388#SSNode", &n));
+        check("ss:// proto", "ss", n.proto);
+        check("ss:// uuid (method:password)", "aes-256-gcm:secret123", n.uuid);
+        check_n("ss:// port", 8388, (int)n.port);
+
+        check_n("ss:// 2022 cipher link: usable", 0,
+                vless_parse_url("ss://2022-blake3-aes-128-gcm:MTIzNDU2Nzg5MDEyMzQ1Ng==@ss.example.com:8388#SS2022", &n));
+        check("ss:// 2022 uuid", "2022-blake3-aes-128-gcm:MTIzNDU2Nzg5MDEyMzQ1Ng==", n.uuid);
+
+        check_n("naive+https:// link: usable", 0,
+                vless_parse_url("naive+https://user1:pass1@naive.example.com:443#NaiveNode", &n));
+        check("naive+https:// proto", "naive", n.proto);
+        check("naive+https:// uuid", "user1:pass1", n.uuid);
+        check("naive+https:// sni defaulted from host", "naive.example.com", n.sni);
+
+        check_n("vmess:// canonical link: usable", 0,
+                vless_parse_url("vmess://chacha20-poly1305:11111111-2222-3333-4444-555555555555@vmess.example.com:443?type=ws&security=tls&sni=vmess.example.com&path=%2Fvmess#VMessNode", &n));
+        check("vmess:// proto", "vmess", n.proto);
+        check("vmess:// uuid", "chacha20-poly1305:11111111-2222-3333-4444-555555555555", n.uuid);
+        check("vmess:// type", "ws", n.type);
+        check("vmess:// path", "/vmess", n.path);
+        vless_node_link(&n, link, sizeof(link));
+        check("vmess:// roundtrip link",
+              "vmess://chacha20-poly1305:11111111-2222-3333-4444-555555555555@vmess.example.com:443?type=ws&security=tls&sni=vmess.example.com&path=%2Fvmess#VMessNode",
+              link);
+
+        /* V2RayN base64 JSON: {"v":"2","ps":"V2N","add":"v2.example.com","port":"8443","id":"11111111-2222-3333-4444-555555555555","scy":"auto","net":"ws","path":"/v2","tls":"tls","sni":"v2.example.com"} */
+        check_n("vmess:// V2RayN base64 JSON: usable", 0,
+                vless_parse_url("vmess://eyJ2IjoiMiIsInBzIjoiVjJOIiwiYWRkIjoidjIuZXhhbXBsZS5jb20iLCJwb3J0IjoiODQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1Iiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwicGF0aCI6Ii92MiIsInRscyI6InRscyIsInNuaSI6InYyLmV4YW1wbGUuY29tIn0=", &n));
+        check("vmess:// V2RayN proto", "vmess", n.proto);
+        check("vmess:// V2RayN name", "V2N", n.name);
+        check("vmess:// V2RayN host", "v2.example.com", n.host);
+        check_n("vmess:// V2RayN port", 8443, (int)n.port);
+        check("vmess:// V2RayN uuid", "11111111-2222-3333-4444-555555555555", n.uuid);
+        check("vmess:// V2RayN type", "ws", n.type);
+        check("vmess:// V2RayN security", "tls", n.security);
+
+        check_n("mierus:// link with host:port: usable", 0,
+                vless_parse_url("mierus://alice:secret99@mieru.example.com:8964#MieruTCP", &n));
+        check("mierus:// proto", "mieru", n.proto);
+        check("mierus:// uuid", "alice:secret99", n.uuid);
+        check("mierus:// host", "mieru.example.com", n.host);
+        check_n("mierus:// port", 8964, (int)n.port);
+        vless_node_link(&n, link, sizeof(link));
+        check("mierus:// roundtrip link",
+              "mierus://alice:secret99@mieru.example.com:8964?type=tcp&security=none#MieruTCP",
+              link);
+
+        check_n("mierus:// link with query port=2048&protocol=TCP: usable", 0,
+                vless_parse_url("mierus://bob:pass123@mieru2.example.com?port=2048&protocol=TCP#MieruQ", &n));
+        check_n("mierus:// query port parsed", 2048, (int)n.port);
+
+        check_n("mierus:// link with protocol=UDP: skipped", 1,
+                vless_parse_url("mierus://bob:pass123@mieru2.example.com?port=2048&protocol=UDP#MieruUDP", &n));
+        check("mierus:// UDP skip reason", "mieru: UDP transport is not supported", n.skip_reason);
+
+        /* Hysteria2 links are gated off by default until explicitly enabled */
+        check_n("hysteria2:// disabled by default", 0, vless_enable_hy2());
+        check_n("hysteria2:// link skipped when experimental gate is off", 1,
+                vless_parse_url("hysteria2://hy2pass@hy2.example.com:8443/?sni=hy2.example.com&insecure=1&obfs=salamander&obfs-password=salsec&mport=20000-50000#Hy2Node", &n));
+        check("hysteria2:// disabled skip reason", "hy2: experimental protocol disabled", n.skip_reason);
+
+        vless_set_enable_hy2(1);
+        check_n("hysteria2:// link with salamander and mport: usable when enabled", 0,
+                vless_parse_url("hysteria2://hy2pass@hy2.example.com:8443/?sni=hy2.example.com&insecure=1&obfs=salamander&obfs-password=salsec&mport=20000-50000#Hy2Node", &n));
+        check("hysteria2:// proto", "hy2", n.proto);
+        check("hysteria2:// type", "quic", n.type);
+        check("hysteria2:// security", "tls", n.security);
+        check("hysteria2:// uuid", "hy2pass", n.uuid);
+        check("hysteria2:// host", "hy2.example.com", n.host);
+        check_n("hysteria2:// port", 8443, (int)n.port);
+        check("hysteria2:// obfs_pass", "salsec", n.obfs_pass);
+        check("hysteria2:// mport", "20000-50000", n.mport);
+        check_n("hysteria2:// insecure allowed by link", 1, n.insecure);
+        vless_node_link(&n, link, sizeof(link));
+        check("hysteria2:// roundtrip link",
+              "hysteria2://hy2pass@hy2.example.com:8443?type=quic&security=tls&sni=hy2.example.com&obfs=salamander&obfs-password=salsec&mport=20000-50000&allowInsecure=1#Hy2Node",
+              link);
+
+        check_n("hy2:// short link with omitted port and authority mport: usable", 0,
+                vless_parse_url("hy2://pw2@hy2short.example.com:443,30000-40000/#Hy2Short", &n));
+        check("hy2:// proto", "hy2", n.proto);
+        check_n("hy2:// port", 443, (int)n.port);
+        check("hy2:// authority mport", "443,30000-40000", n.mport);
+        vless_set_enable_hy2(0);
+
+        check_n("anytls:// link: usable", 0,
+                vless_parse_url("anytls://anypass@any.example.com:443/?sni=any.example.com&fp=chrome#AnyNode", &n));
+        check("anytls:// proto", "anytls", n.proto);
+        check("anytls:// type", "tcp", n.type);
+        check("anytls:// security", "tls", n.security);
+        check("anytls:// uuid", "anypass", n.uuid);
+        check("anytls:// host", "any.example.com", n.host);
+        check_n("anytls:// port", 443, (int)n.port);
+        check("anytls:// fp", "chrome", n.fp);
+        vless_node_link(&n, link, sizeof(link));
+        check("anytls:// roundtrip link",
+              "anytls://anypass@any.example.com:443?type=tcp&security=tls&sni=any.example.com&fp=chrome#AnyNode",
+              link);
+
+        check_n("finiteproto:// link: usable", 0,
+                vless_parse_url("finiteproto://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+                                "?sni=fp.example.com&path=%2Fcdn-bridge&fp_id=c1"
+                                "&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                                "&fp_method=auto#FPNode", &n));
+        check("finiteproto:// proto", "vless", n.proto);
+        check("finiteproto:// type", "xhttp", n.type);
+        check("finiteproto:// mode", "finiteproto", n.mode);
+        check("finiteproto:// security defaults to tls", "tls", n.security);
+        check("finiteproto:// fp_id", "c1", n.fp_id);
+        check("finiteproto:// fp_method", "auto", n.fp_method);
+        vless_node_link(&n, link, sizeof(link));
+        check("finiteproto:// roundtrip vless link",
+              "vless://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+              "?type=xhttp&security=tls&sni=fp.example.com&path=%2Fcdn-bridge&mode=finiteproto"
+              "&fp_id=c1&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              "&fp_method=auto&fp_v=2#FPNode",
+              link);
+
+        check_n("finiteproto missing fp_id: skipped", 1,
+                vless_parse_url("finiteproto://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+                                "?sni=fp.example.com"
+                                "&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef#NoID", &n));
+        check("finiteproto missing fp_id skip reason", "finiteproto: missing fp_id", n.skip_reason);
+
+        check_n("finiteproto bad fp_secret: skipped", 1,
+                vless_parse_url("finiteproto://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+                                "?sni=fp.example.com&fp_id=c1&fp_secret=short#BadSec", &n));
+        check("finiteproto bad fp_secret skip reason", "finiteproto: fp_secret must be 64 hex chars", n.skip_reason);
+
+        check_n("finiteproto non-hex 64B fp_secret: skipped", 1,
+                vless_parse_url("finiteproto://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+                                "?sni=fp.example.com&fp_id=c1"
+                                "&fp_secret=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz#NonHex", &n));
+        check("finiteproto non-hex fp_secret skip reason", "finiteproto: fp_secret must be 64 hex chars", n.skip_reason);
+
+        check_n("fp:// clamps overflowing fp_conc=300 to 255", 0,
+                vless_parse_url("fp://11111111-2222-3333-4444-555555555555@fp.example.com:443"
+                                "?sni=fp.example.com&fp_id=c1&fp_conc=300"
+                                "&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef#Clamp", &n));
+        check_n("fp:// fp_conc clamped to 255", 255, (int)n.fp_conc);
+
+        struct vless_node fp_glued[4];
+        struct vless_sub_stats fp_st;
+        size_t fpg = vless_parse_sub(
+            "finiteproto://11111111-2222-3333-4444-555555555555@fp1.example.com:443"
+            "?sni=fp1.example.com&fp_id=c1&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef#FP1"
+            "fp://11111111-2222-3333-4444-555555555555@fp2.example.com:443"
+            "?sni=fp2.example.com&fp_id=c2&fp_secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef#FP2",
+            fp_glued, 4, &fp_st);
+        check_n("glued finiteproto:// + fp:// links split into 2 nodes", 2, (int)fpg);
+        check("glued finiteproto first name", "FP1", fp_glued[0].name);
+        check("glued fp second name", "FP2", fp_glued[1].name);
+    }
 
     printf("\n%d checks passed", g_pass);
     if (g_fail) {

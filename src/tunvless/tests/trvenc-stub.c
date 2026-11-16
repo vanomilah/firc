@@ -24,3 +24,4 @@ int tr_venc_read(struct transport *t, unsigned char *d, size_t cap, size_t *got)
 int tr_venc_pending(const struct transport *t) { (void)t; return 0; }
 void tr_venc_close(struct transport *t) { (void)t; }
 const char *tr_venc_reason(void) { return ""; }
+int vless_enable_hy2(void) { return 0; }

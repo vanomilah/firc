@@ -680,3 +680,93 @@ int tr_dial(const char *host, uint16_t port, int timeout_s) {
     if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
     return tcp_connect(host, port, timeout_s);
 }
+
+static uint16_t pick_mport(uint16_t fallback, const char *mport) {
+    if (!mport || !mport[0]) return fallback;
+    struct { uint16_t a, b; } r[16];
+    size_t nr = 0;
+    const char *p = mport;
+    while (*p && nr < 16) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        unsigned long a = 0, b = 0;
+        if (*p < '0' || *p > '9') break;
+        while (*p >= '0' && *p <= '9') { a = a * 10 + (unsigned)(*p - '0'); p++; }
+        if (*p == '-') {
+            p++;
+            if (*p < '0' || *p > '9') break;
+            while (*p >= '0' && *p <= '9') { b = b * 10 + (unsigned)(*p - '0'); p++; }
+        } else {
+            b = a;
+        }
+        if (a >= 1 && a <= 65535 && b >= a && b <= 65535) {
+            r[nr].a = (uint16_t)a;
+            r[nr].b = (uint16_t)b;
+            nr++;
+        }
+        while (*p && *p != ',') p++;
+    }
+    if (!nr) return fallback;
+    uint32_t seed = (uint32_t)now_ms() ^ ((uint32_t)getpid() << 16);
+    size_t idx = seed % nr;
+    uint32_t span = (uint32_t)(r[idx].b - r[idx].a) + 1u;
+    return (uint16_t)(r[idx].a + ((seed >> 7) % span));
+}
+
+int tr_dial_udp(const char *host, uint16_t port, const char *mport, int timeout_s) {
+    if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
+    struct tr_ip addr[ADDR_MAX];
+    unsigned an = pinned(host, addr);
+    if (an == 0) an = resolve(host, addr);
+    if (an == 0) return TR_EDNS;
+
+    struct tr_ip *g = good_get(host, port);
+    struct tr_ip ip = g ? *g : addr[0];
+    if (!g) {
+        for (unsigned i = 0; i < an; i++) {
+            if (!addr[i].v6) { ip = addr[i]; break; }
+        }
+    }
+    uint16_t dst_port = pick_mport(port, mport);
+
+    int fd = socket(ip.v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return TR_ESOCK;
+    if (g_sock_mark &&
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
+        g_sock_mark_req) {
+        close(fd);
+        return TR_ECONNECT;
+    }
+    if (g_bind_dev[0] &&
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, (socklen_t)strlen(g_bind_dev) + 1) != 0) {
+        close(fd);
+        return TR_ECONNECT;
+    }
+    int rcvbuf = 2097152, sndbuf = 2097152;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    struct timeval tv = { .tv_sec = timeout_s > 0 ? timeout_s : 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_storage ss;
+    socklen_t sl;
+    memset(&ss, 0, sizeof(ss));
+    if (ip.v6) {
+        struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ss;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_port = htons(dst_port);
+        memcpy(&sa6->sin6_addr, ip.b, 16);
+        sl = sizeof(*sa6);
+    } else {
+        struct sockaddr_in *sa4 = (struct sockaddr_in *)&ss;
+        sa4->sin_family = AF_INET;
+        sa4->sin_port = htons(dst_port);
+        memcpy(&sa4->sin_addr, ip.b, 4);
+        sl = sizeof(*sa4);
+    }
+    if (connect(fd, (struct sockaddr *)&ss, sl) != 0) {
+        close(fd);
+        return TR_ECONNECT;
+    }
+    return fd;
+}

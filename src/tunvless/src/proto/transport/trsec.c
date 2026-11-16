@@ -149,14 +149,60 @@ static int sec_tls_hello(struct tr_link *l, const struct tr_node *n, const char 
         p->eh = eh;
     }
 
-    size_t sent = 0;
-    while (sent < send_n) {
-        ssize_t w = tr_lk_send(l, send_hello + sent, send_n - sent);
-        if (w <= 0) {
-            if (w == -1 && errno == EINTR) continue;
-            return w < -1 ? (int)w : TR_EIO;
+    if (n->record_fragment && send_n > 5 + 16) {
+        /* Split the ClientHello TLS record on the wire into two TLS records (for DPI bypass /
+         * TrustTunnel anti_dpi). Prefer splitting inside the SNI hostname if present; the TLS 1.3
+         * handshake transcript still hashes the unsplit Handshake message in send_hello. */
+        size_t payload_n = send_n - 5;
+        size_t split = payload_n / 2;
+        size_t vlen = verify_host ? strlen(verify_host) : 0;
+        if (vlen >= 4) {
+            const unsigned char *pos = memmem(send_hello + 5, payload_n, verify_host, vlen);
+            if (pos) split = (size_t)(pos - (send_hello + 5)) + vlen / 2;
         }
-        sent += (size_t)w;
+        if (split < 1) split = 1;
+        if (split >= payload_n) split = payload_n - 1;
+        size_t part2 = payload_n - split;
+        unsigned char *frag = malloc(send_n + 5);
+        if (!frag) return TR_EIO;
+        memcpy(frag, send_hello, 3);
+        frag[3] = (unsigned char)(split >> 8);
+        frag[4] = (unsigned char)(split & 0xFF);
+        memcpy(frag + 5, send_hello + 5, split);
+        memcpy(frag + 5 + split, send_hello, 3);
+        frag[5 + split + 3] = (unsigned char)(part2 >> 8);
+        frag[5 + split + 4] = (unsigned char)(part2 & 0xFF);
+        memcpy(frag + 10 + split, send_hello + 5 + split, part2);
+        size_t f1 = 5 + split, f_tot = send_n + 5;
+        for (size_t s1 = 0; s1 < f1; ) {
+            ssize_t w = tr_lk_send(l, frag + s1, f1 - s1);
+            if (w <= 0) {
+                if (w == -1 && errno == EINTR) continue;
+                free(frag);
+                return w < -1 ? (int)w : TR_EIO;
+            }
+            s1 += (size_t)w;
+        }
+        for (size_t s2 = f1; s2 < f_tot; ) {
+            ssize_t w = tr_lk_send(l, frag + s2, f_tot - s2);
+            if (w <= 0) {
+                if (w == -1 && errno == EINTR) continue;
+                free(frag);
+                return w < -1 ? (int)w : TR_EIO;
+            }
+            s2 += (size_t)w;
+        }
+        free(frag);
+    } else {
+        size_t sent = 0;
+        while (sent < send_n) {
+            ssize_t w = tr_lk_send(l, send_hello + sent, send_n - sent);
+            if (w <= 0) {
+                if (w == -1 && errno == EINTR) continue;
+                return w < -1 ? (int)w : TR_EIO;
+            }
+            sent += (size_t)w;
+        }
     }
     p->sent = send_hello;
     p->sent_n = send_n;

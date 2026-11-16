@@ -5,6 +5,7 @@
 
 #include "unit.h"
 #include "vless.h"
+#include "vless_proto.h"
 #include "sublink.h"
 #include "vlink.h"
 #include "fmask.h"
@@ -437,7 +438,7 @@ int main(void) {
             "vless://" UUID "@example.org:443?type=xhttp&security=none&path=/x&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D#x",
             "vless://" UUID "@example.org:443?type=grpc&security=none&serviceName=svc%2Fa&headerType=http#g",
             "vless://" UUID "@example.org:443?type=grpc&security=none&serviceName=s&mode=multi%2Bx#g",
-            "vless://" UUID "@example.org:443?type=tcp&security=none&extra=%7B%22xPaddingObfsMode%22%3Atrue%7D#o",
+            "vless://" UUID "@example.org:443?type=tcp&security=none&extra=%7B%22uplinkDataPlacement%22%3A%22header%22%7D#o",
             "vless://" UUID "@example.org:443?type=tcp&security=none&headerType=http#h",
             "vless://" UUID "@example.org:443?type=tcp&security=none&headerType=none#h",
         };
@@ -1215,6 +1216,52 @@ int main(void) {
     }
 
     t_fm_roundtrip();
+    {
+        /* AWGM multi-protocol link parsing, round-trip, and wire framing verification */
+        struct vless_node n, m;
+        char buf[1024];
+        size_t l;
+
+        vless_set_enable_hy2(1);
+        check("awgm hy2: parse", 0, vless_parse_url(
+            "hy2://pass123@hy2.example.org:443?sni=hy2.example.org&obfs=salamander&obfs-password=secret&mport=20000-30000#HY2", &n));
+        check_str("awgm hy2: proto", "hy2", n.proto);
+        l = vless_node_link(&n, buf, sizeof buf);
+        check("awgm hy2: roundtrip", 0, l ? (vless_parse_url(buf, &m) || strcmp(m.proto, "hy2") || strcmp(m.obfs_pass, "secret")) : -1);
+        vless_set_enable_hy2(0);
+
+        check("awgm ss: parse", 0, vless_parse_url("ss://aes-256-gcm:mysecret@ss.example.org:8388#SS", &n));
+        check_str("awgm ss: proto", "ss", n.proto);
+        l = vless_node_link(&n, buf, sizeof buf);
+        check("awgm ss: roundtrip", 0, l ? (vless_parse_url(buf, &m) || strcmp(m.proto, "ss") || strcmp(m.uuid, "aes-256-gcm:mysecret")) : -1);
+
+        check("awgm trojan: parse", 0, vless_parse_url(
+            "trojan://trpass@trojan.example.org:443?security=tls&sni=trojan.example.org&type=ws&path=%2Ftr#Trojan", &n));
+        check_str("awgm trojan: proto", "trojan", n.proto);
+        l = vless_node_link(&n, buf, sizeof buf);
+        check("awgm trojan: roundtrip", 0, l ? (vless_parse_url(buf, &m) || strcmp(m.proto, "trojan") || strcmp(m.path, "/tr")) : -1);
+
+        check("awgm tt: parse", 0, vless_parse_url(
+            "tt://user:pass@tt.example.org:443?sni=tt.example.org&record_fragment=1#TT", &n));
+        check_str("awgm tt: proto", "tt", n.proto);
+        l = vless_node_link(&n, buf, sizeof buf);
+        check("awgm tt: roundtrip", 0, l ? (vless_parse_url(buf, &m) || strcmp(m.proto, "tt") || !m.record_fragment) : -1);
+
+        check("awgm socks5: parse", 0, vless_parse_url("socks5://suser:spass@10.0.0.1:1080#Socks5", &n));
+        check_str("awgm socks5: proto", "socks5", n.proto);
+        l = vless_node_link(&n, buf, sizeof buf);
+        check("awgm socks5: roundtrip", 0, l ? (vless_parse_url(buf, &m) || strcmp(m.proto, "socks5") || strcmp(m.uuid, "suser:spass")) : -1);
+
+        unsigned char frame[256];
+        size_t fl = trojan_build_request("trpass", VLESS_CMD_TCP, "example.com", NULL, 443, frame, sizeof frame);
+        check("awgm trojan wire frame length", 61 + 1 + 1 + 11 + 2, (long)fl);
+        size_t sl = ss_build_addr("example.com", NULL, 443, frame, sizeof frame);
+        check("awgm ss wire addr length", 1 + 1 + 11 + 2, (long)sl);
+        size_t tl = tt_build_connect("user:pass", "example.com:443", "awgm/1.0", 0, frame, sizeof frame);
+        check("awgm tt wire connect frame", 1, tl > 20 && frame[0] == 'T' && frame[1] == 'T');
+        size_t k5 = socks5_build_connect("example.com", NULL, 443, frame, sizeof frame);
+        check("awgm socks5 wire connect length", 7 + 11, (long)k5);
+    }
 
     for (size_t i = 0; i < NFIELDS; i++) {
         char what[96];

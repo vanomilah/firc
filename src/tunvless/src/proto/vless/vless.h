@@ -15,9 +15,11 @@ struct vless_node {
     char name[128];        /* display name: the #fragment (decoded), remarks, tag or name */
     char host[128];
     uint16_t port;
-    char uuid[64];
-    char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade */
+    char proto[16];        /* vless (or empty) | tt | socks5 | trojan | ss */
+    char uuid[128];        /* VLESS UUID, or user:pass for tt / socks5 */
+    char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade | h2 */
     char security[16];     /* none | tls | reality */
+    uint8_t record_fragment; /* TLS ClientHello record fragmentation (TrustTunnel anti_dpi) */
     char sni[128];         /* SNI of the ClientHello; for reality, the camouflage domain */
     char fp[16];           /* browser fingerprint: chrome, firefox, qq… */
     char pbk[64];          /* server public key, base64url */
@@ -68,6 +70,14 @@ struct vless_node {
     uint8_t tcp_http;
     const char *xhx;
     const struct vless_node *dl;
+    char obfs_pass[64];    /* hy2: salamander obfs-password */
+    char mport[64];        /* hy2: port hopping range (e.g. 20000-50000) */
+    /* FiniteProto v2 transport fields */
+    char fp_id[64];
+    char fp_secret[68];
+    char fp_method[16];
+    uint32_t fp_chunk;
+    uint8_t fp_conc;
     /* Certificate check of a security=tls node (Xray-core: pinnedPeerCertSha256 / `pcs`,
      * verifyPeerCertByName / `vcn`; sing-box: certificate_public_key_sha256). Interned strings
      * (sl_intern), NULL — no such field. pcs and pks — lowercase hex SHA-256, comma separated:
@@ -125,6 +135,11 @@ struct vless_sub_stats {
  * parsers decide whether a node is usable and take no such argument. */
 void vless_set_insecure(int on);
 int vless_insecure(void);
+
+/* Experimental Hysteria2 protocol gate: disabled by default unless explicitly enabled via
+ * vless_set_enable_hy2(1) or TUNVLESS_EXPERIMENTAL_HY2=1. */
+void vless_set_enable_hy2(int on);
+int vless_enable_hy2(void);
 
 /* --fp: chrome or firefox in place of every link's fp; NULL or "" keeps the link's. Call it
  * before worker threads start; the pointer is kept, so the string must live on (argv does). */

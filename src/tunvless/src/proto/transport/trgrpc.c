@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 
 #include "transport.h"
 #include "tscratch.h"
@@ -139,6 +140,7 @@ static int grpc_open(struct transport *t, const struct tr_node *n, int timeout_s
 struct grpc_scratch {
     unsigned char msg[H2_MIN_READ_CAP + 16];
     unsigned char raw[H2_MIN_READ_CAP];
+    unsigned char nbuf[H2_MIN_READ_CAP + 280];
 };
 
 static struct grpc_scratch *scratch(void) {
@@ -173,7 +175,9 @@ static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 /* The end of the stream is known (END_STREAM came with the last data, or an end waits for the
  * next h2_read: pend_err) but only the next read can report it. The socket stays silent once
  * the server has sent everything, so without this the client got no FIN until idle cleanup. */
-static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
+static int grpc_pending(const struct transport *t) {
+    return t->h2.done || t->h2.pend_err || tls13_has_record(&t->link.tls);
+}
 
 /* A gRPC message adds 5 bytes of header and up to 4 of protobuf tag and length to each write. */
 static long grpc_room(struct transport *t) {
@@ -185,4 +189,156 @@ const struct transport_ops tr_grpc = {
     .name = "grpc", .alpn = "h2", .zc = 0,
     .open = grpc_open, .write = grpc_write, .read = grpc_read,
     .moved = grpc_moved, .close = NULL, .pending = grpc_pending, .room = grpc_room,
+};
+
+/* ---- TrustTunnel HTTP/2 CONNECT transport (tr_tt) -------------------------------------------
+ *
+ * TrustTunnel runs over an HTTP/2 stream opened with :method = CONNECT. Because the destination
+ * :authority (host:port, _udp2, or _check) is only known when the flow starts (not during spare
+ * pool preconnect), tt_open prepares the link binding and the first tt_write consumes the
+ * internal 7-byte + strings header built by tt_build_connect() to send the HTTP/2 preface,
+ * SETTINGS, WINDOW_UPDATE and CONNECT HEADERS alongside any initial data.
+ */
+static int tt_open(struct transport *t, const struct tr_node *n, int timeout_s) {
+    (void)n;
+    (void)timeout_s;
+    memset(&t->h2, 0, sizeof(t->h2));
+    t->h2.io.ctx = &t->link;
+    t->h2.io.write = tr_link_write;
+    t->h2.io.read = tr_link_read;
+    t->h2.send_win = 65535;
+    t->h2.send_win_conn = 65535;
+    t->h2.peer_init_win = 65535;
+    memset(&t->de, 0, sizeof(t->de));
+    return 0;
+}
+
+static int tt_write(struct transport *t, const unsigned char *d, size_t n) {
+    if (!t->h2.started) {
+        if (n < 7 || d[0] != 'T' || d[1] != 'T') return H2_EPROTO;
+        int end_stream = d[2];
+        size_t alen = d[3];
+        size_t plen = ((size_t)d[4] << 8) | d[5];
+        size_t ulen = d[6];
+        size_t hdr_len = 7 + alen + plen + ulen;
+        if (!alen || !plen || !ulen || hdr_len > n) return H2_EPROTO;
+        const char *authority = (const char *)(d + 7);
+        const char *proxy_auth = (const char *)(d + 7 + alen);
+        const char *user_agent = (const char *)(d + 7 + alen + plen);
+        if (authority[alen - 1] != '\0' || proxy_auth[plen - 1] != '\0' ||
+            user_agent[ulen - 1] != '\0')
+            return H2_EPROTO;
+        t->de.pb[0] = (unsigned char)end_stream;
+        t->de.naive = !strncmp(user_agent, "Chrome/", 7) ? 1 : 0;
+        struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
+        int rc = h2_start_connect(&t->h2, &io, authority,
+                                  proxy_auth[0] ? proxy_auth : NULL,
+                                  user_agent[0] ? user_agent : NULL, end_stream);
+        if (rc) return rc;
+        d += hdr_len;
+        n -= hdr_len;
+        if (!n) return 0;
+    }
+    while (n > 0 && t->de.naive && t->de.naive_tx < 8) {
+        struct grpc_scratch *s = scratch();
+        if (!s) return TR_EIO;
+        unsigned char *nbuf = s->nbuf;
+        size_t ch = n > 16000 ? 16000 : n;
+        uint8_t pad_len = (uint8_t)((t->de.naive_tx * 17u + 11u) & 0x1Fu);
+        if (pad_len == 0) pad_len = 8;
+        if ((int32_t)(3 + ch + pad_len) > h2_room(&t->h2)) return H2_EWINDOW;
+        nbuf[0] = (unsigned char)(ch >> 8);
+        nbuf[1] = (unsigned char)ch;
+        nbuf[2] = pad_len;
+        memcpy(nbuf + 3, d, ch);
+        memset(nbuf + 3 + ch, 0, pad_len);
+        int rc = h2_write(&t->h2, nbuf, 3 + ch + pad_len);
+        if (rc) return rc;
+        t->de.naive_tx++;
+        d += ch;
+        n -= ch;
+    }
+    if (!n) return 0;
+    return h2_write(&t->h2, d, n);
+}
+
+static int tt_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
+    *got = 0;
+    if (!t->de.naive) {
+        int rc = h2_read(&t->h2, d, cap, got);
+        /* For _check healthcheck probes (end_stream == 1), the server answers with HEADERS (:status 200)
+         * and no body; synthesize a 2-byte VLESS-compatible OK response once status 200 arrives. */
+        if (rc == 0 && *got == 0 && t->de.pb[0] && t->h2.status == 200 && cap >= 2) {
+            d[0] = 0;
+            d[1] = 0;
+            *got = 2;
+            t->de.pb[0] = 0;
+        }
+        return rc;
+    }
+    struct grpc_scratch *s = scratch();
+    if (!s) return TR_EIO;
+    unsigned char *raw = s->raw;
+    size_t rn = 0;
+    int rc = h2_read(&t->h2, raw, sizeof s->raw, &rn);
+    if (rc) return rc;
+    if (!rn) {
+        if (t->de.pb[0] && t->h2.status == 200 && cap >= 2) {
+            d[0] = 0;
+            d[1] = 0;
+            *got = 2;
+            t->de.pb[0] = 0;
+        }
+        return 0;
+    }
+    size_t i = 0;
+    while (i < rn) {
+        if (t->de.naive_rx >= 8 && t->de.field_left == 0 && t->de.naive_pad_left == 0) {
+            size_t rest = rn - i;
+            if (*got + rest > cap) return H2_ETOOBIG;
+            memcpy(d + *got, raw + i, rest);
+            *got += rest;
+            break;
+        }
+        if (t->de.field_left > 0) {
+            size_t take = t->de.field_left < rn - i ? t->de.field_left : rn - i;
+            if (*got + take > cap) return H2_ETOOBIG;
+            memcpy(d + *got, raw + i, take);
+            *got += take;
+            i += take;
+            t->de.field_left -= (uint32_t)take;
+            if (t->de.field_left == 0 && t->de.naive_pad_left == 0) t->de.naive_rx++;
+            continue;
+        }
+        if (t->de.naive_pad_left > 0) {
+            size_t sk = t->de.naive_pad_left < rn - i ? t->de.naive_pad_left : rn - i;
+            i += sk;
+            t->de.naive_pad_left = (uint8_t)(t->de.naive_pad_left - sk);
+            if (t->de.naive_pad_left == 0) t->de.naive_rx++;
+            continue;
+        }
+        while (t->de.hdr_n < 3 && i < rn) t->de.hdr[t->de.hdr_n++] = raw[i++];
+        if (t->de.hdr_n < 3) break;
+        t->de.field_left = ((uint32_t)t->de.hdr[0] << 8) | t->de.hdr[1];
+        t->de.naive_pad_left = t->de.hdr[2];
+        t->de.hdr_n = 0;
+        if (t->de.field_left == 0 && t->de.naive_pad_left == 0) t->de.naive_rx++;
+    }
+    return 0;
+}
+
+static long tt_room(struct transport *t) {
+    if (!t->h2.started) return 16000;
+    long r = h2_room(&t->h2);
+    if (t->de.naive && t->de.naive_tx < 8) {
+        if (r > 16000) r = 16000;
+        r -= 64;
+    }
+    return r > 0 ? r : 0;
+}
+
+const struct transport_ops tr_tt = {
+    .name = "tt", .alpn = "h2", .zc = 0,
+    .open = tt_open, .write = tt_write, .read = tt_read,
+    .moved = grpc_moved, .close = NULL, .pending = grpc_pending, .room = tt_room,
 };

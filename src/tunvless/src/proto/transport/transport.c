@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include "transport.h"
@@ -51,8 +52,19 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
         if (pending) { *got = pending; return 0; }
     }
     if (l->plain || l->rx_direct) {
+        if (!l->tls.fm) {
+            struct pollfd p = { .fd = l->fd, .events = POLLIN };
+            int pr = poll(&p, 1, 0);
+            if (pr <= 0 || !(p.revents & (POLLIN | POLLHUP | POLLERR))) {
+                *got = 0;
+                return 0;
+            }
+        }
         ssize_t r = tr_lk_recv(l, d, cap, 0);
-        if (r < 0 && errno == EINTR) return 0;
+        if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            *got = 0;
+            return 0;
+        }
         if (r <= 0) return tr_lk_err(l, r);
         *got = (size_t)r;
         return 0;
@@ -123,10 +135,14 @@ static int fr_busy(const struct transport *t) {
     return t->fr && t->fr->busy && t->fr->busy(t);
 }
 
-/* VLESS encryption (the node's encryption) is the last layer: over the ready transport, before
- * the VLESS request. */
+/* VLESS encryption (the node's encryption) or Shadowsocks/VMess/Mieru AEAD is the last layer:
+ * over the ready transport, before the protocol request. */
 static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeout_s) {
-    if (!n->encryption || !n->encryption[0]) return 0;
+    int is_proto_enc = n->proto && (!strcmp(n->proto, "ss") ||
+                                    !strcmp(n->proto, "vmess") ||
+                                    !strcmp(n->proto, "mieru") ||
+                                    !strcmp(n->proto, "anytls"));
+    if ((!n->encryption || !n->encryption[0]) && !is_proto_enc) return 0;
     int rc = tr_venc_open(t, n, timeout_s);
     if (rc) transport_close(t);
     return rc;
@@ -136,8 +152,16 @@ static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeo
 
 static int own_links(const struct transport *t) { return t->fr && t->fr->dial; }
 
+extern int vless_enable_hy2(void);
+
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
-    t->fr = transport_of(n->type);
+    if (n->proto && !strcmp(n->proto, "hy2")) {
+        memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
+        t->link.fd = -1;
+        return TR_ENONODE;
+    }
+    int is_h2_connect = n->proto && (!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive"));
+    t->fr = is_h2_connect ? &tr_tt : transport_of(n->type);
     memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
     if (!own_links(t)) t->link.fd = -1;
     int rc = t->fr->dial ? t->fr->dial(t, n, timeout_s) : tr_link_open(&t->link, n, t->fr->alpn, timeout_s);

@@ -420,7 +420,17 @@ static int load_nodes(void) {
     }
     for (int i = 0; i < g.sources_n && !g.control; i++) {
         const char *src = g.sources[i];
-        int link = !strncmp(src, "vless://", 8), in = !strcmp(src, "-");
+        int link = !strncmp(src, "vless://", 8) || !strncmp(src, "tt://", 5) ||
+                   !strncmp(src, "fp://", 5) || !strncmp(src, "finiteproto://", 14) ||
+                   !strncmp(src, "hy2://", 6) || !strncmp(src, "hysteria2://", 12) ||
+                   !strncmp(src, "vmess://", 8) || !strncmp(src, "anytls://", 9) ||
+                   !strncmp(src, "mieru://", 8) || !strncmp(src, "mierus://", 9) ||
+                   !strncmp(src, "trojan://", 9) || !strncmp(src, "ss://", 5) ||
+                   !strncmp(src, "naive+https://", 14) || !strncmp(src, "naive://", 8) ||
+                   !strncmp(src, "socks5://", 9) || !strncmp(src, "socks://", 8) ||
+                   ((!strncmp(src, "https://", 8) || !strncmp(src, "http://", 7)) &&
+                    (strstr(src, "?d=") || strstr(src, "&d=")));
+        int in = !strcmp(src, "-");
         if (!link && !in) g_links_only = 0;
         int rc = in ? load_stdin_nodes() : link ? load_link(src) : load_file(src);
         if (rc) return rc;

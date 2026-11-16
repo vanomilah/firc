@@ -33,7 +33,8 @@ VLESS_SRC     := src/proto/vless/vldial.c src/proto/vless/client.c src/proto/vle
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
                  src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
-                 src/proto/transport/trvenc.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
+                 src/proto/transport/trvenc.c \
+                 src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
                  src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
                  src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
                  src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c
@@ -196,7 +197,8 @@ SUB_SRC := src/proto/vless/sublink.c src/proto/vless/vlink.c src/proto/transport
            src/proto/transport/fmask.c
 $(T)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC) $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/submatch.c $(SUB_SRC)
+	# submatch includes vlink.c directly to exercise its static helpers.
+	$(CC) $(T_CFLAGS) -o $@ tests/submatch.c $(filter-out src/proto/vless/vlink.c,$(SUB_SRC))
 
 $(T)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC) $(HDR)
 	@mkdir -p $(T)

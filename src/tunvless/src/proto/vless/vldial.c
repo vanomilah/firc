@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <poll.h>
 #include <pthread.h>
 #include "osrand.h"
 
@@ -49,7 +50,8 @@ static const char *vl_peer(const void *ctx) {
 
 static void vl_describe(const void *ctx, char *out, size_t n) {
     const struct vless_node *node = ctx;
-    snprintf(out, n, "%s (%s:%u %s%s)", node->name, node->host, node->port, node->type,
+    const char *pr = (node->proto[0] && strcmp(node->proto, "vless")) ? node->proto : node->type;
+    snprintf(out, n, "%s (%s:%u %s%s)", node->name, node->host, node->port, pr,
              node->flow[0] ? " +vision" : "");
 }
 
@@ -149,14 +151,16 @@ static int vl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     s->v6 = k->v6;
     s->established = 0;
     s->host[0] = 0;
-    if (vless_uuid_parse(node->uuid, s->uuid) != 0) {
-        node_id_refused(node, udp ? "UDP connection" : "TCP connection");
-        return -1;
+    if (!node->proto[0] || !strcmp(node->proto, "vless")) {
+        if (vless_uuid_parse(node->uuid, s->uuid) != 0) {
+            node_id_refused(node, udp ? "UDP connection" : "TCP connection");
+            return -1;
+        }
+        /* For UDP, Vision is set up only for a node with flow: there UDP goes as a Mux command with
+         * XUDP frames over the Vision stream (vl_send). Without flow the UDP request declares none,
+         * and there are no Vision frames in either direction. */
+        if (!udp || node->flow[0]) vision_init(&s->vis, s->uuid);
     }
-    /* For UDP, Vision is set up only for a node with flow: there UDP goes as a Mux command with
-     * XUDP frames over the Vision stream (vl_send). Without flow the UDP request declares none,
-     * and there are no Vision frames in either direction. */
-    if (!udp || node->flow[0]) vision_init(&s->vis, s->uuid);
     return 0;
 }
 
@@ -338,6 +342,208 @@ static int xudp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
     return 0;
 }
 
+/* ---- TrustTunnel _udp2 framing --------------------------------------------------------------
+ *
+ * Upstream (_udp2):
+ *   [total_len u32 = 27 + dlen][app_name_len u16 = 0][src_ip 16B (IPv4-mapped)][src_port u16]
+ *   [dst_ip_len u8 = 4][dst_ip 4B][dst_port u16][payload]
+ *
+ * Downstream (_udp2):
+ *   [total_len u32 = 36 + dlen][src_ip 16B][src_port u16][dst_ip 16B][dst_port u16][payload]
+ */
+static size_t tt_udp_frames(const struct flow_key *k, const unsigned char *in, size_t n,
+                            unsigned char *out, size_t cap) {
+    size_t o = 0;
+    while (n) {
+        if (n < 2) return 0;
+        size_t dl = ((size_t)in[0] << 8) | in[1];
+        in += 2;
+        n -= 2;
+        if (dl > n || o + 4 + 27 + dl > cap) return 0;
+        uint32_t total = (uint32_t)(27 + dl);
+        out[o++] = (unsigned char)(total >> 24);
+        out[o++] = (unsigned char)(total >> 16);
+        out[o++] = (unsigned char)(total >> 8);
+        out[o++] = (unsigned char)total;
+        out[o++] = 0; out[o++] = 0;                     /* app_name_len = 0 */
+        memset(out + o, 0, 10); o += 10;                /* IPv4-mapped src_ip ::ffff:a.b.c.d */
+        out[o++] = 0xFF; out[o++] = 0xFF;
+        memcpy(out + o, &k->src, 4); o += 4;
+        out[o++] = (unsigned char)(k->sport >> 8);
+        out[o++] = (unsigned char)k->sport;
+        out[o++] = 4;                                   /* dst_ip_len = 4 (IPv4) */
+        memcpy(out + o, &k->dst, 4); o += 4;
+        out[o++] = (unsigned char)(k->dport >> 8);
+        out[o++] = (unsigned char)k->dport;
+        memcpy(out + o, in, dl);
+        o += dl;
+        in += dl;
+        n -= dl;
+    }
+    return o;
+}
+
+static int tt_udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
+                             dialer_emit_fn emit, void *arg) {
+    while (n) {
+        switch (s->xs) {
+        case XS_LEN: {
+            while (s->lenb_n < 4 && n) {
+                s->dg[s->lenb_n++] = *d++;
+                n--;
+            }
+            if (s->lenb_n < 4) return 0;
+            s->lenb_n = 0;
+            uint32_t total = ((uint32_t)s->dg[0] << 24) | ((uint32_t)s->dg[1] << 16) |
+                             ((uint32_t)s->dg[2] << 8) | s->dg[3];
+            if (total < 36 || total > 36 + 65535) return -1;
+            s->xneed = 36;
+            s->dg_want = (uint16_t)(total - 36);
+            s->dg_have = 0;
+            s->xs = XS_META;
+            break;
+        }
+        case XS_META: {
+            size_t take = (size_t)s->xneed - s->dg_have;
+            if (take > n) take = n;
+            s->dg_have = (uint16_t)(s->dg_have + take);
+            d += take;
+            n -= take;
+            if (s->dg_have < s->xneed) return 0;
+            s->dg_have = 0;
+            if (!s->dg_want) {
+                s->xs = XS_LEN;
+            } else if (s->dg_want > UDP_DGRAM_MAX) {
+                s->dg_skip = s->dg_want;
+                s->dg_want = 0;
+                s->xs = XS_SKIP;
+            } else {
+                s->xs = XS_DATA;
+            }
+            break;
+        }
+        case XS_DATA: {
+            size_t take = (size_t)s->dg_want - s->dg_have;
+            if (take > n) take = n;
+            memcpy(s->dg + s->dg_have, d, take);
+            s->dg_have = (uint16_t)(s->dg_have + take);
+            d += take;
+            n -= take;
+            if (s->dg_have < s->dg_want) return 0;
+            s->xs = XS_LEN;
+            if (emit(arg, s->dg, s->dg_want) != 0) return -1;
+            s->dg_want = 0;
+            s->dg_have = 0;
+            break;
+        }
+        default: {
+            uint32_t take = s->dg_skip < n ? s->dg_skip : (uint32_t)n;
+            d += take;
+            n -= take;
+            s->dg_skip -= take;
+            if (!s->dg_skip) s->xs = XS_LEN;
+            break;
+        }
+        }
+    }
+    return 0;
+}
+
+/* ---- Trojan UDP framing ---------------------------------------------------------------------
+ *
+ * Frame layout (both upstream and downstream):
+ *   [ATYP u8][DST.ADDR][DST.PORT u16][Length u16][CRLF 0x0d 0x0a][Payload]
+ */
+static size_t trojan_udp_frames(const struct flow_key *k, const unsigned char *in, size_t n,
+                                unsigned char *out, size_t cap) {
+    size_t o = 0;
+    while (n) {
+        if (n < 2) return 0;
+        size_t dl = ((size_t)in[0] << 8) | in[1];
+        in += 2;
+        n -= 2;
+        if (dl > n || o + 11 + dl > cap) return 0;
+        out[o++] = 0x01;                                /* IPv4 */
+        memcpy(out + o, &k->dst, 4); o += 4;
+        out[o++] = (unsigned char)(k->dport >> 8);
+        out[o++] = (unsigned char)k->dport;
+        out[o++] = (unsigned char)(dl >> 8);
+        out[o++] = (unsigned char)dl;
+        out[o++] = '\r';
+        out[o++] = '\n';
+        memcpy(out + o, in, dl);
+        o += dl;
+        in += dl;
+        n -= dl;
+    }
+    return o;
+}
+
+static int trojan_udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
+                                 dialer_emit_fn emit, void *arg) {
+    while (n) {
+        switch (s->xs) {
+        case XS_LEN: {
+            if (!s->lenb_n) {
+                s->dg[s->lenb_n++] = *d++;
+                n--;
+                if (s->dg[0] == 0x01) s->xneed = 11;
+                else if (s->dg[0] == 0x04) s->xneed = 23;
+                else if (s->dg[0] == 0x03) s->xneed = 2;
+                else return -1;
+            }
+            if (s->dg[0] == 0x03 && s->lenb_n == 1 && n) {
+                s->dg[s->lenb_n++] = *d++;
+                n--;
+                s->xneed = (uint16_t)(2 + s->dg[1] + 6);
+            }
+            while (s->lenb_n < s->xneed && n) {
+                s->dg[s->lenb_n++] = *d++;
+                n--;
+            }
+            if (s->lenb_n < s->xneed) return 0;
+            uint16_t plen = ((uint16_t)s->dg[s->xneed - 4] << 8) | s->dg[s->xneed - 3];
+            s->lenb_n = 0;
+            s->dg_have = 0;
+            if (!plen) {
+                s->xs = XS_LEN;
+            } else if (plen > UDP_DGRAM_MAX) {
+                s->dg_skip = plen;
+                s->dg_want = 0;
+                s->xs = XS_SKIP;
+            } else {
+                s->dg_want = plen;
+                s->xs = XS_DATA;
+            }
+            break;
+        }
+        case XS_DATA: {
+            size_t take = (size_t)s->dg_want - s->dg_have;
+            if (take > n) take = n;
+            memcpy(s->dg + s->dg_have, d, take);
+            s->dg_have = (uint16_t)(s->dg_have + take);
+            d += take;
+            n -= take;
+            if (s->dg_have < s->dg_want) return 0;
+            s->xs = XS_LEN;
+            if (emit(arg, s->dg, s->dg_want) != 0) return -1;
+            s->dg_want = 0;
+            s->dg_have = 0;
+            break;
+        }
+        default: {
+            uint32_t take = s->dg_skip < n ? s->dg_skip : (uint32_t)n;
+            d += take;
+            n -= take;
+            s->dg_skip -= take;
+            if (!s->dg_skip) s->xs = XS_LEN;
+            break;
+        }
+        }
+    }
+    return 0;
+}
+
 /* Sends data to the node in the right form: with the VLESS header before the first data, and
  * wrapped in Vision if the node requires it. */
 static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
@@ -350,37 +556,151 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     unsigned char out[TUNNEL_BUF];
     const unsigned char *body = data;
     size_t len = 0;
+    const int is_tt = !strcmp(node->proto, "tt");
+    const int is_naive = !strcmp(node->proto, "naive");
+    const int is_socks = !strcmp(node->proto, "socks5");
+    const int is_trojan = !strcmp(node->proto, "trojan");
+    const int is_ss = !strcmp(node->proto, "ss");
+    const int is_vmess = !strcmp(node->proto, "vmess");
+    const int is_mieru = !strcmp(node->proto, "mieru");
+    const int is_hy2 = !strcmp(node->proto, "hy2");
+    const int is_anytls = !strcmp(node->proto, "anytls");
 
-    /* UDP to a node with flow: XUDP frames instead of length-prefixed datagrams (see XUDP above).
-     * The data framed by dgram_frame is repacked into xb; from there the path is shared with
-     * TCP: Vision, then the write. */
-    const int xudp = udp && node->flow[0];
     unsigned char xb[TUNNEL_BUF];
-    if (xudp) {
-        size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
-        if (!xn) return SEND_FATAL;
-        data = xb;
-        n = xn;
-        body = xb;
-        if (!s->header_sent) {
-            /* Mux has no port and address in the header (vless_build_request): the
-             * v1.mux.cool:666 service is implied by the command. */
-            len = vless_build_request(s->uuid, VLESS_CMD_MUX, NULL, NULL, 0, 0, node->flow,
-                                      out, sizeof(out));
+    if (udp && !strcmp(node->mode, "finiteproto")) return SEND_FATAL;
+
+    if (is_tt || is_naive) {
+        if (udp) {
+            if (is_naive) return SEND_FATAL;
+            size_t xn = tt_udp_frames(k, data, n, xb, sizeof xb);
+            if (!xn) return SEND_FATAL;
+            data = xb;
+            n = xn;
+            body = xb;
+            if (!s->header_sent) {
+                len = tt_build_connect(node->uuid, "_udp2", "udp", 0, out, sizeof(out));
+                if (!len) return SEND_FATAL;
+            }
+        } else if (!s->header_sent) {
+            unsigned char ip4[4];
+            memcpy(ip4, k->dst.b, 4);
+            char auth[280];
+            if (s->host[0])
+                snprintf(auth, sizeof(auth), "%s:%u", s->host, k->dport);
+            else
+                snprintf(auth, sizeof(auth), "%u.%u.%u.%u:%u",
+                         ip4[0], ip4[1], ip4[2], ip4[3], k->dport);
+            len = tt_build_connect(node->uuid, auth, is_naive ? "Chrome/128.0.0.0" : "tcp", 0, out, sizeof(out));
             if (!len) return SEND_FATAL;
         }
-    } else if (!s->header_sent) {
-        /* The destination comes from the packet: there is no name, the client has already
-         * resolved it. */
-        /* UDP gets here only for a node without flow (see XUDP above) and is declared with
-         * command 2 and no flow: Vision (xtls-rprx-vision) is about TCP, it replaces the copying
-         * of the stream after the handshake, and datagrams have no such stream.
-         *
-         * dport is already in host order (struct flow_key in tun.h). */
-        len = vless_build_request(s->uuid, udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
-                                  s->host[0] ? s->host : NULL, k->dst.b, k->v6 ? 16 : 4, k->dport,
-                                  udp ? NULL : node->flow, out, sizeof(out));
-        if (!len) return SEND_FATAL;
+    } else if (is_trojan) {
+        unsigned char ip4[4];
+        memcpy(ip4, k->dst.b, 4);
+        if (udp) {
+            size_t xn = trojan_udp_frames(k, data, n, xb, sizeof xb);
+            if (!xn) return SEND_FATAL;
+            data = xb;
+            n = xn;
+            body = xb;
+            if (!s->header_sent) {
+                len = trojan_build_request(node->uuid, 0x03, NULL, ip4, k->dport, out, sizeof(out));
+                if (!len) return SEND_FATAL;
+            }
+        } else if (!s->header_sent) {
+            len = trojan_build_request(node->uuid, 0x01, s->host[0] ? s->host : NULL, ip4, k->dport, out, sizeof(out));
+            if (!len) return SEND_FATAL;
+        }
+    } else if (is_ss || is_vmess || is_hy2 || is_anytls) {
+        if (udp && is_ss) return SEND_FATAL;
+        if (udp && (is_vmess || is_hy2)) {
+            if (n < 2 || (((size_t)data[0] << 8) | data[1]) + 2 != n) return SEND_FATAL;
+            data += 2;
+            n -= 2;
+            body = data;
+        }
+        /* Shadowsocks AEAD / SS-2022, VMess AEAD, AnyTLS, or Hysteria2: prepend the target
+         * address header before the first payload bytes. */
+        if (!s->header_sent) {
+            unsigned char ip4[4];
+            memcpy(ip4, k->dst.b, 4);
+            if (udp && is_anytls) {
+                static const unsigned char uot_magic[28] = {
+                    0x03, 23,
+                    's','p','.','v','2','.','u','d','p','-','o','v','e','r','-','t','c','p','.','a','r','p','a',
+                    0x00, 0x00, 0x01
+                };
+                memcpy(out, uot_magic, 28);
+                size_t al = ss_build_addr(s->host[0] ? s->host : NULL, ip4, k->dport, out + 28, sizeof(out) - 28);
+                if (!al) return SEND_FATAL;
+                len = 28 + al;
+            } else {
+                len = ss_build_addr(s->host[0] ? s->host : NULL, ip4, k->dport, out, sizeof(out));
+                if (!len) return SEND_FATAL;
+                if (udp && (is_vmess || is_hy2)) out[0] |= 0x80u;
+            }
+        }
+    } else if (is_socks || is_mieru) {
+        if (udp) return SEND_FATAL;
+        if (!s->header_sent) {
+            unsigned char ip4[4];
+            memcpy(ip4, k->dst.b, 4);
+            size_t clen = socks5_build_connect(s->host[0] ? s->host : NULL, ip4, k->dport, out, sizeof(out));
+            if (!clen) return SEND_FATAL;
+            if (is_socks) {
+                /* RFC 1928 §4/§6: wait for the SOCKS5 CONNECT reply before sending payload so
+                 * the server's handshake read buffer never consumes pipelined stream bytes. */
+                if (transport_write(&s->t, out, clen) != 0) return SEND_FATAL;
+                unsigned char rep[264];
+                size_t rhave = 0, skip = 0;
+                for (int tries = 0; tries < 25; tries++) {
+                    size_t got = 0;
+                    if (transport_read(&s->t, rep + rhave, sizeof(rep) - rhave, &got) != 0) return SEND_FATAL;
+                    rhave += got;
+                    int pr = socks5_parse_reply(rep, rhave, &skip);
+                    if (pr == 0) break;
+                    if (pr != VLESS_EAGAIN) return SEND_FATAL;
+                    struct pollfd pw = { .fd = transport_fd(&s->t), .events = POLLIN, .revents = 0 };
+                    poll(&pw, 1, 200);
+                }
+                if (!skip) return SEND_FATAL;
+                s->header_sent = 1;
+                s->established = 1;
+                if (!n) return SEND_OK;
+            } else {
+                len = clen;
+            }
+        }
+    } else {
+        /* UDP to a node with flow: XUDP frames instead of length-prefixed datagrams (see XUDP above).
+         * The data framed by dgram_frame is repacked into xb; from there the path is shared with
+         * TCP: Vision, then the write. */
+        const int xudp = udp && node->flow[0];
+        if (xudp) {
+            size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
+            if (!xn) return SEND_FATAL;
+            data = xb;
+            n = xn;
+            body = xb;
+            if (!s->header_sent) {
+                /* Mux has no port and address in the header (vless_build_request): the
+                 * v1.mux.cool:666 service is implied by the command. */
+                len = vless_build_request(s->uuid, VLESS_CMD_MUX, NULL, NULL, 0, 0, node->flow,
+                                          out, sizeof(out));
+                if (!len) return SEND_FATAL;
+            }
+        } else if (!s->header_sent) {
+            /* The destination comes from the packet: there is no name, the client has already
+             * resolved it. */
+            /* UDP gets here only for a node without flow (see XUDP above) and is declared with
+             * command 2 and no flow: Vision (xtls-rprx-vision) is about TCP, it replaces the copying
+             * of the stream after the handshake, and datagrams have no such stream.
+             *
+             * dport is already in host order (struct flow_key in tun.h). */
+            len = vless_build_request(s->uuid, udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
+                                      s->host[0] ? s->host : NULL, k->dst.b, k->v6 ? 16 : 4, k->dport,
+                                      udp ? NULL : node->flow, out, sizeof(out));
+            if (!len) return SEND_FATAL;
+        }
     }
 
     /* n == 0 (the stack's call for a silent client, dialer.h): the header alone, as Xray's client
@@ -620,18 +940,50 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
      * inside it. */
     const unsigned char *cur = rx;
     size_t left = got;
+    const int is_tt = !strcmp(node->proto, "tt");
+    const int is_naive = !strcmp(node->proto, "naive");
+    const int is_socks = !strcmp(node->proto, "socks5");
+    const int is_trojan = !strcmp(node->proto, "trojan");
+    const int is_ss = !strcmp(node->proto, "ss");
+    const int is_vmess = !strcmp(node->proto, "vmess");
+    const int is_mieru = !strcmp(node->proto, "mieru");
+    const int is_hy2 = !strcmp(node->proto, "hy2");
+    const int is_anytls = !strcmp(node->proto, "anytls");
+
+    if (udp && !strcmp(node->mode, "finiteproto")) return SEND_FATAL;
 
     if (!s->established) {
-        size_t skip = 0;
-        if (vless_parse_response(cur, left, &skip) != 0) {
-            TR("VLESS response not parsed (%zu bytes)\n", left);
-            return -1;
+        if (is_tt || is_naive || is_trojan || is_ss || is_vmess || is_hy2 || is_anytls) {
+            /* No protocol-level response header on the stream. */
+            s->established = 1;
+        } else if (is_socks || is_mieru) {
+            size_t skip = 0;
+            if (socks5_parse_reply(cur, left, &skip) != 0) {
+                TR("SOCKS5 reply not parsed (%zu bytes)\n", left);
+                return -1;
+            }
+            cur += skip;
+            left -= skip;
+            s->established = 1;
+        } else {
+            size_t skip = 0;
+            if (vless_parse_response(cur, left, &skip) != 0) {
+                TR("VLESS response not parsed (%zu bytes)\n", left);
+                return -1;
+            }
+            cur += skip;
+            left -= skip;
+            s->established = 1;
+            TR("response header stripped (%zu bytes), %zu left\n", skip, left);
         }
-        cur += skip;
-        left -= skip;
-        s->established = 1;
-        TR("response header stripped (%zu bytes), %zu left\n", skip, left);
     }
+
+    if (is_tt && udp)
+        return left ? tt_udp_downstream(s, cur, left, emit, arg) : 0;
+    if (is_trojan && udp)
+        return left ? trojan_udp_downstream(s, cur, left, emit, arg) : 0;
+    if (is_vmess && udp)
+        return left ? emit(arg, cur, left) : 0;
 
     /* Here the paths split: TCP is a stream in Vision frames, UDP without flow is datagrams with
      * a two-byte length and no Vision (the UDP request did not declare it). UDP to a node with
@@ -675,11 +1027,13 @@ int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_
      * named: past this point it is parsed per connection (vl_flow_open), and a failure there would
      * mean a tunnel that is up but closes everything. */
     const struct vless_node *node = pc->node(pc->first);
-    unsigned char id[16];
-    if (vless_uuid_parse(node->uuid, id) != 0) {
-        fprintf(stderr, "tunvless[error]: the UUID of node %s does not parse — %s is not brought up; "
-                        "check the node's link\n", node->name, tc->dev);
-        return 1;
+    if (!node->proto[0] || !strcmp(node->proto, "vless")) {
+        unsigned char id[16];
+        if (vless_uuid_parse(node->uuid, id) != 0) {
+            fprintf(stderr, "tunvless[error]: the UUID of node %s does not parse — %s is not brought up; "
+                            "check the node's link\n", node->name, tc->dev);
+            return 1;
+        }
     }
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     return pool_run(tc, pc, ready, arg);
@@ -695,7 +1049,10 @@ static long vl_room(const void *ctx, void *sess) {
     if (q >= 0 && (r < 0 || q < r)) r = q;
     if (r < 0) return -1;
     if (s->t.fr == &tr_grpc) r -= VL_GRPC_FRAME * (r / VL_UP_WRITE);
-    if (!s->header_sent) r -= 64 + (s->host[0] ? 1 + (long)strlen(s->host) : 0);
+    if (!s->header_sent) {
+        long hdr = (!strcmp(node->proto, "tt") || !strcmp(node->proto, "naive")) ? 384 : 64;
+        r -= hdr + (s->host[0] ? 1 + (long)strlen(s->host) : 0);
+    }
     if (node->flow[0] && s->vis.is_padding) r -= 2048;
     return r > 0 ? r : 0;
 }

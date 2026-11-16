@@ -71,6 +71,7 @@
 #include "../src/proto/tls/certverify.c"
 #include "fmrelay.h"
 #include "client.h"
+#include "vless_proto.h"
 
 #include "scrypto.h"
 #include "reality.h"
@@ -83,6 +84,7 @@
  * copy of crypto code is a second place where scalar clamping could differ. */
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
+void tr_venc_test_set_vmess_counts(struct transport *t, uint32_t tx_cnt, uint32_t rx_cnt);
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
@@ -905,7 +907,9 @@ static void *server_half(void *arg) {
     memcpy(s->hs, hs, HLEN);
     if (xlabel(s->s_hs, "key", NULL, 0, s->key, sizeof(s->key)) != 0) return NULL;
     if (xlabel(s->s_hs, "iv", NULL, 0, s->iv, sizeof(s->iv)) != 0) return NULL;
+#if defined(STEER_HAVE_X509WRITE)
     note_secrets(s->hs, s->c_hs, s->s_hs, s->key);
+#endif
 
     /* ---- EncryptedExtensions ---- */
     unsigned char ee[64];
@@ -1133,6 +1137,7 @@ static void node_tls(struct vless_node *n, const char *type) {
     snprintf(n->fp, sizeof(n->fp), "%s", "chrome");
 }
 #endif
+
 
 /* One run: make a socket pair, give one end to the client and the other to the server half.
  *
@@ -3313,6 +3318,385 @@ int main(void) {
         check("security=none: nothing left on the heap", 0, LEAK_CHECK());
     }
 
+    /* Shadowsocks AEAD (SIP004) and SS-2022 (SIP022) stream encryption/decryption over tcp:
+     * verifies that transport_open attaches tr_venc (ss_open), encrypts the SOCKS5 target
+     * address + payload on write (no plaintext on the wire), and decrypts the server's
+     * encrypted response chunks on read. */
+    {
+        struct vless_node ssn;
+        memset(&ssn, 0, sizeof(ssn));
+        snprintf(ssn.proto, sizeof(ssn.proto), "%s", "ss");
+        snprintf(ssn.host, sizeof(ssn.host), "%s", "node.invalid");
+        ssn.port = 8388;
+        snprintf(ssn.uuid, sizeof(ssn.uuid), "%s", "aes-256-gcm:my-secret-password");
+        snprintf(ssn.type, sizeof(ssn.type), "%s", "tcp");
+        snprintf(ssn.security, sizeof(ssn.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&ssn, &c, 3);
+        g_tcp_dial = NULL;
+        check("ss aes-256-gcm: connection established with AEAD layer", 0, rc);
+        check("ss aes-256-gcm: c.enc attached", 1, c.enc != NULL);
+
+        unsigned char req_plain[64];
+        size_t alen = ss_build_addr("example.com", NULL, 443, req_plain, sizeof(req_plain));
+        const char *http_req = "GET / HTTP/1.1\r\n\r\n";
+        size_t hlen = strlen(http_req);
+        memcpy(req_plain + alen, http_req, hlen);
+        size_t total_plain = alen + hlen;
+
+        check("ss aes-256-gcm: transport_write succeeds", 0,
+              transport_write(&c, req_plain, total_plain));
+
+        unsigned char wire[256];
+        ssize_t wn = recv(sv[1], wire, sizeof(wire), 0);
+        /* 32B salt + (2B len + 16B tag) + (total_plain + 16B tag) */
+        check("ss aes-256-gcm: wire length matches salt + AEAD chunk",
+              (long)(32 + 18 + total_plain + 16), (long)wn);
+        /* Wire must not contain plaintext "example.com" */
+        int found_plain = 0;
+        for (ssize_t i = 0; i + 11 <= wn; i++) {
+            if (!memcmp(wire + i, "example.com", 11)) found_plain = 1;
+        }
+        check("ss aes-256-gcm: no plaintext target host on wire", 0, found_plain);
+
+        /* Derive server key and decrypt client's chunk to verify wire format */
+        unsigned char psk[32], prev[16];
+        const char *pass = "my-secret-password";
+        size_t plen = strlen(pass), gen = 0;
+        while (gen < 32) {
+            struct sc_hash_ctx hc;
+            sc_hash_init(&hc, SC_MD5);
+            if (gen > 0) sc_hash_update(&hc, prev, 16);
+            sc_hash_update(&hc, pass, plen);
+            sc_hash_final(&hc, prev);
+            sc_hash_free(&hc);
+            memcpy(psk + gen, prev, 16);
+            gen += 16;
+        }
+        unsigned char c_subkey[32];
+        sc_hkdf(SC_SHA1, wire, 32, psk, 32, "ss-subkey", 9, c_subkey, 32);
+        struct sc_aead srv_rd;
+        sc_aead_setkey(&srv_rd, SC_AES256_GCM, c_subkey);
+        unsigned char n0[12] = {0}, n1[12] = {1, 0};
+        check("ss aes-256-gcm: server opens length header", 0,
+              sc_aead_open(&srv_rd, n0, NULL, 0, wire + 32, 2, wire + 34));
+        size_t clen = ((size_t)wire[32] << 8) | wire[33];
+        check("ss aes-256-gcm: decrypted chunk length matches", (long)total_plain, (long)clen);
+        check("ss aes-256-gcm: server opens payload", 0,
+              sc_aead_open(&srv_rd, n1, NULL, 0, wire + 50, clen, wire + 50 + clen));
+        check("ss aes-256-gcm: decrypted payload matches request", 0,
+              memcmp(wire + 50, req_plain, total_plain));
+        sc_aead_free(&srv_rd);
+
+        /* Server sends encrypted response back to client */
+        unsigned char srv_wire[128];
+        memset(srv_wire, 0x42, 32); /* 32B server salt */
+        unsigned char s_subkey[32];
+        sc_hkdf(SC_SHA1, srv_wire, 32, psk, 32, "ss-subkey", 9, s_subkey, 32);
+        struct sc_aead srv_wr;
+        sc_aead_setkey(&srv_wr, SC_AES256_GCM, s_subkey);
+        const char *http_resp = "HTTP/1.1 200 OK\r\n\r\n";
+        size_t rlen = strlen(http_resp);
+        srv_wire[32] = (unsigned char)(rlen >> 8);
+        srv_wire[33] = (unsigned char)rlen;
+        sc_aead_seal(&srv_wr, n0, NULL, 0, srv_wire + 32, 2, srv_wire + 34);
+        memcpy(srv_wire + 50, http_resp, rlen);
+        sc_aead_seal(&srv_wr, n1, NULL, 0, srv_wire + 50, rlen, srv_wire + 50 + rlen);
+        sc_aead_free(&srv_wr);
+        check("ss aes-256-gcm: server writes encrypted response", 0,
+              wr_all(sv[1], srv_wire, 50 + rlen + 16));
+
+        unsigned char rx_buf[128];
+        size_t got = 0;
+        check("ss aes-256-gcm: transport_read decrypts response", 0,
+              transport_read(&c, rx_buf, sizeof(rx_buf), &got));
+        check("ss aes-256-gcm: decrypted response length", (long)rlen, (long)got);
+        check("ss aes-256-gcm: decrypted response content", 0,
+              memcmp(rx_buf, http_resp, rlen));
+
+        transport_close(&c);
+        close(sv[1]);
+        check("ss aes-256-gcm: nothing left on the heap", 0, LEAK_CHECK());
+    }
+    {
+        struct vless_node ss22;
+        memset(&ss22, 0, sizeof(ss22));
+        snprintf(ss22.proto, sizeof(ss22.proto), "%s", "ss");
+        snprintf(ss22.host, sizeof(ss22.host), "%s", "node.invalid");
+        ss22.port = 8388;
+        /* 16 bytes of 0x11 in base64: EREQEBAQEBAQEBAQEBAQEA== (16 bytes of 0x10..0x11)
+         * Let's use 16 zero bytes: AAAAAAAAAAAAAAAAAAAAAA== */
+        snprintf(ss22.uuid, sizeof(ss22.uuid), "%s", "2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==");
+        snprintf(ss22.type, sizeof(ss22.type), "%s", "tcp");
+        snprintf(ss22.security, sizeof(ss22.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&ss22, &c, 3);
+        g_tcp_dial = NULL;
+        check("ss-2022 aes-128-gcm: connection established", 0, rc);
+
+        unsigned char req_plain[64];
+        size_t alen = ss_build_addr("example.com", NULL, 443, req_plain, sizeof(req_plain));
+        const char *http_req = "PING";
+        size_t hlen = strlen(http_req);
+        memcpy(req_plain + alen, http_req, hlen);
+        size_t total_plain = alen + hlen;
+
+        check("ss-2022 aes-128-gcm: first transport_write succeeds", 0,
+              transport_write(&c, req_plain, total_plain));
+
+        unsigned char wire[256];
+        ssize_t wn = recv(sv[1], wire, sizeof(wire), 0);
+        /* 16B salt + (11B fixed hdr + 16B tag) + (total_plain + 2B pad_len + 16B tag) */
+        check("ss-2022 aes-128-gcm: wire length matches SIP022 request stream",
+              (long)(16 + 27 + total_plain + 2 + 16), (long)wn);
+
+        /* Server sends SIP022 response header + payload */
+        unsigned char srv_wire[128];
+        memset(srv_wire, 0x77, 16); /* 16B server salt */
+        unsigned char mat[32];
+        memset(mat, 0, 16);         /* 16 zero bytes PSK */
+        memcpy(mat + 16, srv_wire, 16);
+        unsigned char s_subkey[16];
+        sc_blake3_derive_key(s_subkey, 16, "shadowsocks 2022 session subkey", 31, mat, 32);
+        struct sc_aead srv_wr;
+        sc_aead_setkey(&srv_wr, SC_AES128_GCM, s_subkey);
+        unsigned char n0[12] = {0}, n1[12] = {1, 0};
+        /* SIP022 response fixed header: [0x01][8B ts][16B client_salt][u16 payload_len] = 27B */
+        unsigned char *rh = srv_wire + 16;
+        rh[0] = 0x01;
+        memset(rh + 1, 0, 8);
+        memcpy(rh + 9, wire, 16); /* echo client salt */
+        const char *pong = "PONG";
+        size_t rlen = strlen(pong);
+        rh[25] = (unsigned char)(rlen >> 8);
+        rh[26] = (unsigned char)rlen;
+        sc_aead_seal(&srv_wr, n0, NULL, 0, rh, 27, rh + 27);
+        unsigned char *rp = rh + 43;
+        memcpy(rp, pong, rlen);
+        sc_aead_seal(&srv_wr, n1, NULL, 0, rp, rlen, rp + rlen);
+        sc_aead_free(&srv_wr);
+        check("ss-2022 aes-128-gcm: server writes SIP022 response", 0,
+              wr_all(sv[1], srv_wire, 16 + 43 + rlen + 16));
+
+        unsigned char rx_buf[64];
+        size_t got = 0;
+        check("ss-2022 aes-128-gcm: transport_read decrypts SIP022 response", 0,
+              transport_read(&c, rx_buf, sizeof(rx_buf), &got));
+        check("ss-2022 aes-128-gcm: decrypted response length", (long)rlen, (long)got);
+        check("ss-2022 aes-128-gcm: decrypted response content", 0,
+              memcmp(rx_buf, pong, rlen));
+
+        transport_close(&c);
+        close(sv[1]);
+        check("ss-2022 aes-128-gcm: nothing left on the heap", 0, LEAK_CHECK());
+    }
+    {
+        struct vless_node any;
+        memset(&any, 0, sizeof(any));
+        snprintf(any.proto, sizeof(any.proto), "%s", "anytls");
+        snprintf(any.host, sizeof(any.host), "%s", "node.invalid");
+        any.port = 443;
+        snprintf(any.uuid, sizeof(any.uuid), "%s", "anytls-secret");
+        snprintf(any.type, sizeof(any.type), "%s", "tcp");
+        snprintf(any.security, sizeof(any.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&any, &c, 3);
+        g_tcp_dial = NULL;
+        check("anytls: connection established with 0-RTT prewrite", 0, rc);
+
+        unsigned char req_plain[64];
+        size_t alen = ss_build_addr("example.com", NULL, 443, req_plain, sizeof(req_plain));
+        const char *http_req = "PING";
+        size_t hlen = strlen(http_req);
+        memcpy(req_plain + alen, http_req, hlen);
+        size_t total_plain = alen + hlen;
+
+        check("anytls: first transport_write sends prewrite + PSH", 0,
+              transport_write(&c, req_plain, total_plain));
+
+        unsigned char wire[256];
+        ssize_t wn = recv(sv[1], wire, sizeof(wire), 0);
+        static const char settings[] = "v=2\nclient=tunvless\npadding-md5=04cfa2939c724322dc67282362a8f718";
+        size_t slen = sizeof(settings) - 1;
+        size_t pre_n = 34 + 7 + slen + 7;
+        check("anytls: wire length matches 34B auth + cmdSettings + cmdSyn + cmdPush",
+              (long)(pre_n + 7 + total_plain), (long)wn);
+        unsigned char exp_sha[32];
+        sc_hash(SC_SHA256, "anytls-secret", 13, exp_sha);
+        check("anytls: wire starts with SHA-256(password)", 0, memcmp(wire, exp_sha, 32));
+        check("anytls: frame 1 is cmd=4 (cmdSettings)", 4, (long)wire[34]);
+        check("anytls: frame 2 is cmd=1 (cmdSyn) sid=1", 1,
+              wire[34 + 7 + slen] == 1 && wire[34 + 7 + slen + 4] == 1);
+        check("anytls: frame 3 is cmd=2 (cmdPsh) sid=1", 1,
+              wire[pre_n] == 2 && wire[pre_n + 4] == 1 &&
+              (((size_t)wire[pre_n + 5] << 8) | wire[pre_n + 6]) == total_plain);
+        check("anytls: PSH payload matches SOCKS5 target + data", 0,
+              memcmp(wire + pre_n + 7, req_plain, total_plain));
+
+        /* Server sends cmdSynAck (cmd=7, len=0) followed by cmdPsh (cmd=2, len=4, "PONG") */
+        unsigned char srv_wire[18] = {
+            7, 0, 0, 0, 1, 0, 0,
+            2, 0, 0, 0, 1, 0, 4, 'P', 'O', 'N', 'G'
+        };
+        check("anytls: server writes cmdSynAck + cmdPush response", 0,
+              wr_all(sv[1], srv_wire, sizeof(srv_wire)));
+
+        unsigned char rx_buf[64];
+        size_t got = 0;
+        check("anytls: transport_read parses frames and returns PSH payload", 0,
+              transport_read(&c, rx_buf, sizeof(rx_buf), &got));
+        check("anytls: response length is 4", 4, (long)got);
+        check("anytls: response content is PONG", 0, memcmp(rx_buf, "PONG", 4));
+
+        transport_close(&c);
+        close(sv[1]);
+        check("anytls: nothing left on the heap", 0, LEAK_CHECK());
+    }
+    {
+        struct vless_node trj;
+        memset(&trj, 0, sizeof(trj));
+        snprintf(trj.proto, sizeof(trj.proto), "%s", "trojan");
+        snprintf(trj.host, sizeof(trj.host), "%s", "node.invalid");
+        trj.port = 443;
+        snprintf(trj.uuid, sizeof(trj.uuid), "%s", "trojan-secret");
+        snprintf(trj.type, sizeof(trj.type), "%s", "tcp");
+        snprintf(trj.security, sizeof(trj.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&trj, &c, 3);
+        g_tcp_dial = NULL;
+        check("trojan: connection established", 0, rc);
+
+        unsigned char req_buf[128];
+        size_t hdr_n = trojan_build_request(trj.uuid, VLESS_CMD_TCP, "example.com", NULL, 443, req_buf, sizeof(req_buf));
+        memcpy(req_buf + hdr_n, "PING", 4);
+        check("trojan: transport_write sends SHA224 header + payload", 0, transport_write(&c, req_buf, hdr_n + 4));
+
+        unsigned char wire[128];
+        ssize_t wn = recv(sv[1], wire, sizeof(wire), 0);
+        char exp_hex[57];
+        trojan_sha224_hex("trojan-secret", exp_hex);
+        check("trojan: wire starts with SHA224(password) + CRLF", 0,
+              wn == (ssize_t)(hdr_n + 4) ? memcmp(wire, exp_hex, 56) : -1);
+        check("trojan: wire ends with CRLF + PING", 0, memcmp(wire + hdr_n - 2, "\r\nPING", 6));
+
+        check("trojan: server writes PONG", 0, wr_all(sv[1], (const unsigned char *)"PONG", 4));
+        unsigned char rx_buf[32];
+        size_t got = 0;
+        check("trojan: transport_read receives PONG", 0, transport_read(&c, rx_buf, sizeof(rx_buf), &got));
+        check("trojan: response matches PONG", 0, got == 4 ? memcmp(rx_buf, "PONG", 4) : -1);
+        transport_close(&c);
+        close(sv[1]);
+    }
+    {
+        struct vless_node s5;
+        memset(&s5, 0, sizeof(s5));
+        snprintf(s5.proto, sizeof(s5.proto), "%s", "socks5");
+        snprintf(s5.host, sizeof(s5.host), "%s", "10.0.0.1");
+        s5.port = 1080;
+        snprintf(s5.uuid, sizeof(s5.uuid), "%s", "suser:spass");
+        snprintf(s5.type, sizeof(s5.type), "%s", "tcp");
+        snprintf(s5.security, sizeof(s5.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        static const unsigned char s5_srv_hs[4] = { 0x05, 0x02, 0x01, 0x00 };
+        wr_all(sv[1], s5_srv_hs, sizeof(s5_srv_hs));
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&s5, &c, 3);
+        g_tcp_dial = NULL;
+        check("socks5: RFC1929 auth handshake established", 0, rc);
+
+        unsigned char hs_wire[64];
+        ssize_t hwn = recv(sv[1], hs_wire, sizeof(hs_wire), 0);
+        static const unsigned char exp_hs[] = {
+            0x05, 0x02, 0x00, 0x02,
+            0x01, 0x05, 's', 'u', 's', 'e', 'r', 0x05, 's', 'p', 'a', 's', 's'
+        };
+        check("socks5: client sent greeting + RFC1929 credentials", 0,
+              hwn == (ssize_t)sizeof(exp_hs) ? memcmp(hs_wire, exp_hs, sizeof(exp_hs)) : -1);
+
+        unsigned char req_buf[64];
+        size_t req_n = socks5_build_connect("example.com", NULL, 80, req_buf, sizeof(req_buf));
+        memcpy(req_buf + req_n, "PING", 4);
+        check("socks5: transport_write sends CONNECT + payload", 0, transport_write(&c, req_buf, req_n + 4));
+
+        static const unsigned char s5_rep[] = { 0x05, 0x00, 0x00, 0x01, 10, 0, 0, 1, 0x00, 0x50, 'P', 'O', 'N', 'G' };
+        check("socks5: server writes CONNECT reply + PONG", 0, wr_all(sv[1], s5_rep, sizeof(s5_rep)));
+        unsigned char rx_buf[64];
+        size_t got = 0, skip = 0;
+        check("socks5: transport_read receives reply + PONG", 0, transport_read(&c, rx_buf, sizeof(rx_buf), &got));
+        check("socks5: socks5_parse_reply strips 10B BND.ADDR header", 0,
+              socks5_parse_reply(rx_buf, got, &skip) == 0 && skip == 10 && got == 14 && !memcmp(rx_buf + skip, "PONG", 4) ? 0 : -1);
+        transport_close(&c);
+        close(sv[1]);
+    }
+    /* B4: VMess AEAD 16-bit chunk counter exhaustion check (must fail cleanly after chunk 0xFFFF
+     * instead of wrapping around and reusing nonce 0). */
+    {
+        struct vless_node vmn;
+        memset(&vmn, 0, sizeof(vmn));
+        snprintf(vmn.proto, sizeof(vmn.proto), "%s", "vmess");
+        snprintf(vmn.host, sizeof(vmn.host), "%s", "node.invalid");
+        vmn.port = 443;
+        snprintf(vmn.uuid, sizeof(vmn.uuid), "%s", "aes-128-gcm:11111111-2222-3333-4444-555555555555");
+        snprintf(vmn.type, sizeof(vmn.type), "%s", "tcp");
+        snprintf(vmn.security, sizeof(vmn.security), "%s", "none");
+
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&vmn, &c, 3);
+        g_tcp_dial = NULL;
+        check("vmess B4: connection established", 0, rc);
+
+        unsigned char req_plain[64];
+        size_t alen = ss_build_addr("example.com", NULL, 443, req_plain, sizeof(req_plain));
+        memcpy(req_plain + alen, "FIRST", 5);
+        check("vmess B4: initial request header + chunk 0 write succeeds", 0,
+              transport_write(&c, req_plain, alen + 5));
+        unsigned char drain[512];
+        (void)recv(sv[1], drain, sizeof(drain), 0);
+
+        /* Advance TX counter to 0xFFFF (last valid 16-bit nonce) */
+        tr_venc_test_set_vmess_counts(&c, 0xFFFFu, 0);
+        check("vmess B4: chunk 0xFFFF (65535) write succeeds", 0,
+              transport_write(&c, (const unsigned char *)"LAST", 4));
+        (void)recv(sv[1], drain, sizeof(drain), 0);
+
+        /* Next write at 0x10000 (65536) must fail with TR_EVENC instead of wrapping nonce to 0 */
+        check("vmess B4: chunk 0x10000 (65536) refused with TR_EVENC", TR_EVENC,
+              transport_write(&c, (const unsigned char *)"WRAP", 4));
+        check_str("vmess B4: TX nonce exhaustion reason reported",
+                  "VMess AEAD TX nonce limit reached", tr_venc_reason());
+
+        transport_close(&c);
+        close(sv[1]);
+        check("vmess B4: nothing left on the heap", 0, LEAK_CHECK());
+    }
 #if !defined(__SANITIZE_ADDRESS__)
     printf("\nWARNING: built WITHOUT AddressSanitizer: the 'nothing left on the heap' checks\n");
     printf("         are vacuous. Return codes and descriptors are checked, the heap is NOT.\n");

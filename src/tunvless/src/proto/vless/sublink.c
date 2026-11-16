@@ -584,6 +584,15 @@ static volatile int g_insecure;
 void vless_set_insecure(int on) { g_insecure = on ? 1 : 0; }
 int vless_insecure(void) { return g_insecure; }
 
+static volatile int g_enable_hy2 = 0;
+void vless_set_enable_hy2(int on) { g_enable_hy2 = on ? 1 : 0; }
+int vless_enable_hy2(void) {
+    const char *env = getenv("TUNVLESS_EXPERIMENTAL_HY2");
+    if (env && (!strcmp(env, "0") || !strcasecmp(env, "false"))) return 0;
+    if (env && (!strcmp(env, "1") || !strcasecmp(env, "true"))) return 1;
+    return g_enable_hy2;
+}
+
 static const char *volatile g_fp;
 void vless_set_fp(const char *fp) { g_fp = fp && fp[0] ? fp : NULL; }
 const char *vless_fp(void) { return g_fp; }
@@ -696,6 +705,10 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
         sl_set_pct(n->type, sizeof(n->type), v, vlen);
         if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
         else if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
+        else if (!strcmp(n->type, "finiteproto") || !strcmp(n->type, "fp")) {
+            snprintf(n->type, sizeof(n->type), "xhttp");
+            snprintf(n->mode, sizeof(n->mode), "finiteproto");
+        }
     }
     else if (klen == 8 && !strncmp(k, "security", 8)) sl_set_pct(n->security, sizeof(n->security), v, vlen);
     else if (klen == 3 && !strncmp(k, "sni", 3)) sl_set_pct(n->sni, sizeof(n->sni), v, vlen);
@@ -733,7 +746,9 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
         char *d = sl_param_dup(v, vlen);
         if (d) { sl_set_ech(n, d); free(d); } else n->ech = SL_BAD_ECH;
     }
-    else if ((klen == 13 && !strncmp(k, "allowInsecure", 13)) || (klen == 8 && !strncmp(k, "insecure", 8))) {
+    else if ((klen == 13 && !strncmp(k, "allowInsecure", 13)) ||
+             (klen == 14 && !strncmp(k, "allow_insecure", 14)) ||
+             (klen == 8 && !strncmp(k, "insecure", 8))) {
         char *d = sl_param_dup(v, vlen);
         if (d) { if (sl_truthy(d)) n->allow_insecure = 1; free(d); }
     }
@@ -743,9 +758,41 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
         else n->fm = SL_FULL;
         free(d);
     }
+    else if ((klen == 15 && !strncmp(k, "record_fragment", 15)) || (klen == 8 && !strncmp(k, "anti_dpi", 8))) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) { if (sl_truthy(d)) n->record_fragment = 1; free(d); }
+    }
     else if (klen == 4 && !strncmp(k, "path", 4)) sl_set_pct(n->path, sizeof(n->path), v, vlen);
     else if (klen == 11 && !strncmp(k, "serviceName", 11)) sl_set_pct(n->service, sizeof(n->service), v, vlen);
     else if (klen == 4 && !strncmp(k, "mode", 4)) sl_set_pct(n->mode, sizeof(n->mode), v, vlen);
+    /* FiniteProto v2 parameters */
+    else if ((klen == 5 && !strncmp(k, "fp_id", 5)) || (klen == 9 && !strncmp(k, "client_id", 9)))
+        sl_set_pct(n->fp_id, sizeof(n->fp_id), v, vlen);
+    else if (klen == 9 && !strncmp(k, "fp_secret", 9))
+        sl_set_pct(n->fp_secret, sizeof(n->fp_secret), v, vlen);
+    else if (klen == 9 && !strncmp(k, "fp_method", 9))
+        sl_set_pct(n->fp_method, sizeof(n->fp_method), v, vlen);
+    else if (klen == 8 && !strncmp(k, "fp_chunk", 8)) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) {
+            char *ep = NULL;
+            unsigned long cv = (*d >= '0' && *d <= '9') ? strtoul(d, &ep, 10) : 0;
+            if (ep && !*ep && cv > 0) n->fp_chunk = cv > 1048576UL ? 1048576U : (uint32_t)cv;
+            free(d);
+        }
+    }
+    else if (klen == 7 && !strncmp(k, "fp_conc", 7)) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) {
+            char *ep = NULL;
+            unsigned long cv = (*d >= '0' && *d <= '9') ? strtoul(d, &ep, 10) : 0;
+            if (ep && !*ep && cv > 0) n->fp_conc = cv > 255UL ? 255U : (uint8_t)cv;
+            free(d);
+        }
+    }
+    else if (klen == 4 && !strncmp(k, "fp_v", 4)) {
+        /* Version indicator, accepted */
+    }
     /* host: the Host header of ws and httpupgrade. xhttp links carry it too, but xhttp does not
      * use it: its :authority is the sni, else the address. */
     else if (klen == 4 && !strncmp(k, "host", 4)) sl_set_pct(n->http_host, sizeof(n->http_host), v, vlen);
@@ -860,30 +907,58 @@ int sl_link_usable_pre(struct vless_node *n) {
         return 1;
     }
     if (!strcmp(n->type, "xhttp")) {
-        struct xh_opts o;
-        if (n->xhx == SL_BAD_XHX || n->xhx == SL_BAD_XHX_JSON) {
-            snprintf(n->skip_reason, sizeof(n->skip_reason), "%s",
-                     n->xhx == SL_BAD_XHX ? "xhttp: invalid extra value" : "xhttp: extra does not parse");
-            return 1;
+        if (!strcmp(n->mode, "finiteproto")) {
+            if (!n->fp_id[0] || !sl_printable(n->fp_id)) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "finiteproto: missing fp_id");
+                return 1;
+            }
+            size_t slen = strlen(n->fp_secret);
+            int hex_ok = (slen == 64);
+            for (size_t i = 0; hex_ok && i < 64; i++) {
+                char c = n->fp_secret[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                    hex_ok = 0;
+            }
+            if (!hex_ok) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "finiteproto: fp_secret must be 64 hex chars");
+                return 1;
+            }
+            for (const char *p = n->http_host; *p; p++) {
+                if ((unsigned char)*p <= 0x20 || *p == 0x7f) {
+                    snprintf(n->skip_reason, sizeof(n->skip_reason), "invalid host for xhttp");
+                    return 1;
+                }
+            }
+            if (n->headers_bad || !hdr_lines_ok(n->headers, 0)) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "invalid headers for xhttp");
+                return 1;
+            }
+        } else {
+            struct xh_opts o;
+            if (n->xhx == SL_BAD_XHX || n->xhx == SL_BAD_XHX_JSON) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "%s",
+                         n->xhx == SL_BAD_XHX ? "xhttp: invalid extra value" : "xhttp: extra does not parse");
+                return 1;
+            }
+            if (n->xhx == SL_FULL) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "too many distinct keys");
+                return 1;
+            }
+            if (n->headers_bad || !hdr_lines_ok(n->headers, 0)) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "invalid headers for xhttp");
+                return 1;
+            }
+            if (n->dl == &SL_DL_FULL) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "too many distinct download blocks");
+                return 1;
+            }
+            if (n->dl && n->dl->skip_reason[0]) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "downloadSettings: %.77s", n->dl->skip_reason);
+                return 1;
+            }
+            if (xh_opts_parse(n->xhx, n->mode, n->pad_to, &o, n->skip_reason, sizeof(n->skip_reason)))
+                return 1;
         }
-        if (n->xhx == SL_FULL) {
-            snprintf(n->skip_reason, sizeof(n->skip_reason), "too many distinct keys");
-            return 1;
-        }
-        if (n->headers_bad || !hdr_lines_ok(n->headers, 0)) {
-            snprintf(n->skip_reason, sizeof(n->skip_reason), "invalid headers for xhttp");
-            return 1;
-        }
-        if (n->dl == &SL_DL_FULL) {
-            snprintf(n->skip_reason, sizeof(n->skip_reason), "too many distinct download blocks");
-            return 1;
-        }
-        if (n->dl && n->dl->skip_reason[0]) {
-            snprintf(n->skip_reason, sizeof(n->skip_reason), "downloadSettings: %.77s", n->dl->skip_reason);
-            return 1;
-        }
-        if (xh_opts_parse(n->xhx, n->mode, n->pad_to, &o, n->skip_reason, sizeof(n->skip_reason)))
-            return 1;
     }
     if (n->encryption == SL_FULL || n->pqv == SL_FULL || n->pcs == SL_FULL || n->pks == SL_FULL ||
         n->vcn == SL_FULL || n->fm == SL_FULL) {
@@ -919,12 +994,15 @@ int sl_link_usable_pre(struct vless_node *n) {
             return 1;
         }
         /* A security decision: a subscription cannot turn certificate checks off by itself. A
-         * node with allowInsecure is usable only when the user gave --insecure. */
-        if (n->allow_insecure && !g_insecure) {
+         * node with allowInsecure is usable only when the user gave --insecure (except for
+         * TrustTunnel/Hysteria2/AnyTLS links where insecure=1 is part of the URI spec). */
+        if (n->allow_insecure && !g_insecure && strcmp(n->proto, "tt") != 0 &&
+            strcmp(n->proto, "hy2") != 0 && strcmp(n->proto, "anytls") != 0) {
             snprintf(n->skip_reason, sizeof(n->skip_reason), "allowInsecure: needs --insecure");
             return 1;
         }
-        n->insecure = g_insecure ? 1 : 0;
+        n->insecure = (g_insecure || (n->allow_insecure &&
+                       (!strcmp(n->proto, "tt") || !strcmp(n->proto, "hy2") || !strcmp(n->proto, "anytls")))) ? 1 : 0;
     }
 
     return 0;
@@ -932,6 +1010,10 @@ int sl_link_usable_pre(struct vless_node *n) {
 
 /* Second half (sublink.h): what VLESS checks after the id. */
 int sl_link_usable_post(struct vless_node *n) {
+    if (!strcmp(n->proto, "hy2") && !vless_enable_hy2()) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "hy2: experimental protocol disabled");
+        return 1;
+    }
     if (strcmp(n->security, "reality") != 0 && strcmp(n->security, "none") != 0 &&
         strcmp(n->security, "tls") != 0) {
         /* xtls is not TLS with chain verification but an exchange of its own, which the client
@@ -945,7 +1027,9 @@ int sl_link_usable_post(struct vless_node *n) {
      * that is the address, and a certificate is almost never issued to an IP. Saying so here is
      * clearer than a failed handshake that blames the server. (For reality an empty sni is
      * valid, see below.) */
-    if (strcmp(n->security, "tls") == 0 && !n->sni[0] && !sl_host_is_name(n->host)) {
+    if (strcmp(n->security, "tls") == 0 && !n->sni[0] && !sl_host_is_name(n->host) &&
+        !((!strcmp(n->proto, "hy2") || !strcmp(n->proto, "anytls") || !strcmp(n->proto, "tt")) &&
+          (n->insecure || n->pcs || n->pks))) {
         snprintf(n->skip_reason, sizeof(n->skip_reason),
                  "tls to an IP address without sni: nothing to verify");
         return 1;
@@ -961,7 +1045,8 @@ int sl_link_usable_post(struct vless_node *n) {
     }
     const int upg_ws = !strcmp(n->type, "ws"), upg = upg_ws || !strcmp(n->type, "httpupgrade");
     if (strcmp(n->type, "tcp") != 0 && strcmp(n->type, "grpc") != 0 &&
-        strcmp(n->type, "xhttp") != 0 && !upg) {
+        strcmp(n->type, "xhttp") != 0 &&
+        !(strcmp(n->type, "quic") == 0 && !strcmp(n->proto, "hy2")) && !upg) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "transport %s is not supported", n->type);
         return 1;
     }
@@ -978,7 +1063,7 @@ int sl_link_usable_post(struct vless_node *n) {
      * would reach this machine (the kernel takes 0.0.0.0 as local) or someone else's network.
      * The reason is reported with the node name as its example, so the panel's message reaches
      * the user. Private networks are not rejected (sl_host_leads_nowhere). */
-    if (sl_host_leads_nowhere(n->host)) {
+    if (strcmp(n->proto, "socks5") != 0 && sl_host_leads_nowhere(n->host)) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "%.20s: nobody to answer", n->host);
         return 1;
     }
@@ -994,7 +1079,8 @@ int sl_link_usable_post(struct vless_node *n) {
      * no GET, so a download block with it is refused, as Xray does. */
     if (!strcmp(n->type, "xhttp") && n->mode[0] &&
         strcmp(n->mode, "auto") != 0 && strcmp(n->mode, "stream-one") != 0 &&
-        strcmp(n->mode, "stream-up") != 0 && strcmp(n->mode, "packet-up") != 0) {
+        strcmp(n->mode, "stream-up") != 0 && strcmp(n->mode, "packet-up") != 0 &&
+        strcmp(n->mode, "finiteproto") != 0) {
         snprintf(n->skip_reason, sizeof(n->skip_reason),
                  "xhttp mode=%s is not supported", n->mode);
         return 1;

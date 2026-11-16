@@ -40,6 +40,459 @@ static void set_encryption(struct vless_node *n, const char *v) {
 
 static int node_usable(struct vless_node *n);
 
+/* ---- TrustTunnel (tt://, https://...?d=) and SOCKS5 (socks5://, socks://) ------------------- */
+
+static void tt_sha256_hex(const unsigned char *data, size_t len, char hex[65]) {
+    static const uint32_t K[64] = {
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+    };
+    uint32_t h[8] = {
+        0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+        0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u
+    };
+    unsigned char blk[64];
+    size_t off = 0;
+    uint64_t bits = (uint64_t)len * 8;
+    int padded = 0;
+    while (!padded) {
+        size_t rem = len - off;
+        if (rem >= 64) {
+            memcpy(blk, data + off, 64);
+            off += 64;
+        } else {
+            memset(blk, 0, 64);
+            if (rem > 0) memcpy(blk, data + off, rem);
+            if (off <= len) {
+                blk[rem] = 0x80;
+                off = len + 1;
+            }
+            if (rem < 56) {
+                for (int i = 0; i < 8; i++) blk[56 + i] = (unsigned char)(bits >> (56 - 8 * i));
+                padded = 1;
+            }
+        }
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = ((uint32_t)blk[4*i] << 24) | ((uint32_t)blk[4*i+1] << 16) |
+                   ((uint32_t)blk[4*i+2] << 8) | (uint32_t)blk[4*i+3];
+        for (int i = 16; i < 64; i++) {
+            uint32_t x = w[i-15], y = w[i-2];
+            uint32_t s0 = ((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3);
+            uint32_t s1 = ((y >> 17) | (y << 15)) ^ ((y >> 19) | (y << 13)) ^ (y >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0], b=h[1], c=h[2], d=h[3], e=h[4], f=h[5], g=h[6], hh=h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t S1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+            uint32_t S0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    static const char HX[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 4; j++) {
+            unsigned char byte = (unsigned char)(h[i] >> (24 - 8 * j));
+            hex[i * 8 + j * 2] = HX[byte >> 4];
+            hex[i * 8 + j * 2 + 1] = HX[byte & 15];
+        }
+    }
+    hex[64] = '\0';
+}
+
+/* Walk a DER certificate chain (one or more concatenated ASN.1 SEQUENCEs) and format their
+ * SHA-256 fingerprints into comma-separated hex for sl_add_pins(n, pins, 0). Returns 0 on valid
+ * DER, -1 on malformed DER. */
+static int tt_der_pins(const unsigned char *der, size_t n, char *out, size_t cap) {
+    if (!n) return -1;
+    size_t p = 0, o = 0;
+    out[0] = '\0';
+    while (p < n) {
+        if (p + 2 > n || der[p] != 0x30) return -1;
+        size_t hdr = 2, len = der[p + 1];
+        if (len & 0x80) {
+            size_t k = len & 0x7f;
+            if (k == 0 || k > 4 || p + 2 + k > n) return -1;
+            len = 0;
+            for (size_t i = 0; i < k; i++) len = (len << 8) | der[p + 2 + i];
+            hdr += k;
+        }
+        if (len == 0 || p + hdr + len > n) return -1;
+        char hex[65];
+        tt_sha256_hex(der + p, hdr + len, hex);
+        if (o + 66 >= cap) return -1;
+        if (o) out[o++] = ',';
+        memcpy(out + o, hex, 64);
+        o += 64;
+        out[o] = '\0';
+        p += hdr + len;
+    }
+    return o ? 0 : -1;
+}
+
+static int tt_varint(const unsigned char *b, size_t n, uint64_t *val, size_t *used) {
+    if (!n) return -1;
+    size_t len = (size_t)1u << (b[0] >> 6);
+    if (n < len) return -1;
+    uint64_t v = b[0] & 0x3fu;
+    for (size_t i = 1; i < len; i++) v = (v << 8) | b[i];
+    *val = v;
+    *used = len;
+    return 0;
+}
+
+static int is_tt_connect_url(const char *url) {
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) return 0;
+    const char *hash = strchr(url, '#');
+    const char *q = strchr(url, '?');
+    if (!q || (hash && q > hash)) return 0;
+    const char *end = hash ? hash : url + strlen(url);
+    const char *k = q + 1;
+    while (k < end) {
+        const char *amp = memchr(k, '&', (size_t)(end - k));
+        const char *stop = amp ? amp : end;
+        if (stop - k > 2 && k[0] == 'd' && k[1] == '=') return 1;
+        if (!amp) break;
+        k = amp + 1;
+    }
+    return 0;
+}
+
+static int is_tt_tlv_url(const char *url) {
+    if (!strncmp(url, "tt://", 5)) {
+        const char *p = url + 5;
+        const char *hash = strchr(p, '#');
+        const char *q = strchr(p, '?');
+        const char *end = q ? q : hash ? hash : p + strlen(p);
+        /* Canonical tt://user:pass@host:port has '@' before '?' and '#'. */
+        if (memchr(p, '@', (size_t)(end - p))) return 0;
+        return 1;
+    }
+    return is_tt_connect_url(url);
+}
+
+/* Strict base64/base64url decode for TrustTunnel TLV payloads: rejects non-base64 characters. */
+static int tt_b64_decode(const char *in, size_t n, unsigned char *out, size_t cap, size_t *out_n) {
+    *out_n = 0;
+    if (!n) return -1;
+    unsigned acc = 0;
+    int bits = 0, pad = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=') { pad++; continue; }
+        if (pad) return -1;
+        int v = -1;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+' || c == '-') v = 62;
+        else if (c == '/' || c == '_') v = 63;
+        if (v < 0) return -1;
+        acc = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= cap) return -1;
+            out[o++] = (unsigned char)((acc >> bits) & 0xFFu);
+        }
+    }
+    if (bits >= 6 || (acc & ((1u << bits) - 1u)) != 0 || o == 0) return -1;
+    *out_n = o;
+    return 0;
+}
+
+/* Parse a TrustTunnel TLV deep-link (tt://?<TLV> or http(s)://...?d=<TLV>&name=...) into 1..max
+ * nodes (one per address in the TLV). Returns 0 if at least one node is usable, 1 if skipped
+ * (reason in out[0].skip_reason), -1 if not a TrustTunnel TLV link. */
+static int tt_parse_tlv_multi(const char *url, struct vless_node *out, size_t max, size_t *out_n) {
+    *out_n = 0;
+    if (!max || !is_tt_tlv_url(url)) return -1;
+    memset(&out[0], 0, sizeof(out[0]));
+    snprintf(out[0].proto, sizeof(out[0].proto), "tt");
+
+    const char *b64 = NULL;
+    size_t b64_n = 0;
+    char label[128] = "";
+    const char *hash = strchr(url, '#');
+    if (hash) sl_set_name(label, sizeof(label), hash + 1);
+
+    if (!strncmp(url, "tt://", 5)) {
+        const char *p = url + 5;
+        if (*p == '?') p++;
+        const char *end = hash ? hash : p + strlen(p);
+        b64 = p;
+        b64_n = (size_t)(end - p);
+    } else {
+        const char *q = strchr(url, '?');
+        const char *end = hash ? hash : url + strlen(url);
+        const char *k = q + 1;
+        while (k < end) {
+            const char *amp = memchr(k, '&', (size_t)(end - k));
+            const char *stop = amp ? amp : end;
+            const char *eq = memchr(k, '=', (size_t)(stop - k));
+            if (eq) {
+                size_t kl = (size_t)(eq - k), vl = (size_t)(stop - eq - 1);
+                const char *v = eq + 1;
+                if (kl == 1 && k[0] == 'd') { b64 = v; b64_n = vl; }
+                else if (kl == 4 && !strncmp(k, "name", 4)) {
+                    sl_set_pct(label, sizeof(label), v, vl);
+                    sl_utf8_trim_tail(label);
+                }
+            }
+            if (!amp) break;
+            k = amp + 1;
+        }
+    }
+
+    if (!b64 || !b64_n) {
+        snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: empty payload");
+        *out_n = 1;
+        return 1;
+    }
+
+    unsigned char raw[4096];
+    size_t raw_n = 0;
+    if (tt_b64_decode(b64, b64_n, raw, sizeof(raw), &raw_n) != 0) {
+        snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: invalid base64url payload");
+        *out_n = 1;
+        return 1;
+    }
+
+    char hostname[128] = "", custom_sni[128] = "", username[64] = "", password[64] = "", tlv_name[128] = "";
+    char addrs[16][144];
+    size_t n_addrs = 0;
+    uint8_t skip_verify = 0, anti_dpi = 0;
+    char pins_hex[520] = "";
+
+    size_t pos = 0;
+    while (pos < raw_n) {
+        uint64_t tag = 0, flen = 0;
+        size_t u1 = 0, u2 = 0;
+        if (tt_varint(raw + pos, raw_n - pos, &tag, &u1) != 0) {
+            snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: truncated TLV tag");
+            *out_n = 1;
+            return 1;
+        }
+        pos += u1;
+        if (tt_varint(raw + pos, raw_n - pos, &flen, &u2) != 0 || flen > raw_n - pos - u2) {
+            snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: truncated TLV value");
+            *out_n = 1;
+            return 1;
+        }
+        pos += u2;
+        const unsigned char *val = raw + pos;
+        size_t vlen = (size_t)flen;
+        pos += vlen;
+
+        switch (tag) {
+        case 0x00: {
+            uint64_t ver = 0;
+            size_t vu = 0;
+            if (tt_varint(val, vlen, &ver, &vu) != 0 || ver > 1) {
+                snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: unsupported TLV version");
+                *out_n = 1;
+                return 1;
+            }
+            break;
+        }
+        case 0x01: sl_set_field(hostname, sizeof(hostname), (const char *)val, vlen); break;
+        case 0x02:
+            if (n_addrs < 16) sl_set_field(addrs[n_addrs++], sizeof(addrs[0]), (const char *)val, vlen);
+            break;
+        case 0x03: sl_set_field(custom_sni, sizeof(custom_sni), (const char *)val, vlen); break;
+        case 0x05: sl_set_field(username, sizeof(username), (const char *)val, vlen); break;
+        case 0x06: sl_set_field(password, sizeof(password), (const char *)val, vlen); break;
+        case 0x07: skip_verify = (vlen == 1 && val[0] == 1) ? 1 : 0; break;
+        case 0x08:
+            if (tt_der_pins(val, vlen, pins_hex, sizeof(pins_hex)) != 0) {
+                snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: invalid certificate DER");
+                *out_n = 1;
+                return 1;
+            }
+            break;
+        case 0x09: {
+            uint64_t up = 0;
+            size_t vu = 0;
+            if (tt_varint(val, vlen, &up, &vu) != 0) {
+                snprintf(out[0].skip_reason, sizeof(out[0].skip_reason), "tt: invalid upstream_protocol");
+                *out_n = 1;
+                return 1;
+            }
+            break;
+        }
+        case 0x0A: anti_dpi = (vlen == 1 && val[0] == 1) ? 1 : 0; break;
+        case 0x0C:
+            sl_set_field(tlv_name, sizeof(tlv_name), (const char *)val, vlen);
+            sl_utf8_trim_tail(tlv_name);
+            break;
+        default: break;
+        }
+    }
+
+    const char *base_name = label[0] ? label : tlv_name[0] ? tlv_name : hostname;
+    if (base_name[0]) snprintf(out[0].name, sizeof(out[0].name), "%s", base_name);
+
+    if (!hostname[0] || !n_addrs || !username[0] || !password[0]) {
+        snprintf(out[0].skip_reason, sizeof(out[0].skip_reason),
+                 !hostname[0] ? "tt: missing hostname" :
+                 !n_addrs ? "tt: missing address" : "tt: missing username or password");
+        *out_n = 1;
+        return 1;
+    }
+
+    const char *sni = custom_sni[0] ? custom_sni : hostname;
+    size_t count = n_addrs < max ? n_addrs : max;
+    int any_ok = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct vless_node *nd = &out[i];
+        memset(nd, 0, sizeof(*nd));
+        snprintf(nd->proto, sizeof(nd->proto), "tt");
+        snprintf(nd->type, sizeof(nd->type), "tcp");
+        snprintf(nd->security, sizeof(nd->security), "tls");
+        if (n_addrs > 1)
+            snprintf(nd->name, sizeof(nd->name), "%.*s-%u", (int)(sizeof(nd->name) - 16), base_name, (unsigned)(i + 1));
+        else
+            snprintf(nd->name, sizeof(nd->name), "%s", base_name);
+        sl_utf8_trim_tail(nd->name);
+
+        const char *a = addrs[i];
+        const char *colon = strrchr(a, ':');
+        if (!colon || colon == a) {
+            snprintf(nd->skip_reason, sizeof(nd->skip_reason), "tt: invalid address");
+            continue;
+        }
+        size_t hl = (size_t)(colon - a);
+        const char *hs = a;
+        if (hl >= 2 && hs[0] == '[' && hs[hl - 1] == ']') {
+            /* IPv6 literal in brackets: keep brackets so sl_host_is_name / tunnodes recognizes it. */
+            sl_set_field(nd->host, sizeof(nd->host), hs, hl);
+        } else {
+            sl_set_field(nd->host, sizeof(nd->host), hs, hl);
+        }
+        nd->port = sl_port_of(colon + 1);
+        if (!nd->port) {
+            snprintf(nd->skip_reason, sizeof(nd->skip_reason), "tt: invalid port");
+            continue;
+        }
+        snprintf(nd->uuid, sizeof(nd->uuid), "%s:%s", username, password);
+        snprintf(nd->sni, sizeof(nd->sni), "%s", sni);
+        if (custom_sni[0] && strcmp(custom_sni, hostname) != 0) sl_set_vcn(nd, hostname);
+        if (pins_hex[0]) sl_add_pins(nd, pins_hex, 0);
+        nd->allow_insecure = skip_verify;
+        nd->record_fragment = anti_dpi;
+        if (node_usable(nd) == 0) any_ok = 1;
+    }
+    *out_n = count;
+    return any_ok ? 0 : 1;
+}
+
+static int socks_parse_url(const char *url, struct vless_node *n) {
+    size_t scl = !strncmp(url, "socks5://", 9) ? 9 : !strncmp(url, "socks://", 8) ? 8 : 0;
+    if (!scl) return -1;
+    memset(n, 0, sizeof(*n));
+    snprintf(n->proto, sizeof(n->proto), "socks5");
+    snprintf(n->type, sizeof(n->type), "tcp");
+    snprintf(n->security, sizeof(n->security), "none");
+
+    const char *p = url + scl;
+    const char *hash = strchr(p, '#');
+    const char *qmark = memchr(p, '?', (size_t)((hash ? hash : p + strlen(p)) - p));
+    const char *hp_end = qmark ? qmark : hash ? hash : p + strlen(p);
+    const char *at = memchr(p, '@', (size_t)(hp_end - p));
+    if (at) {
+        char cred[192];
+        sl_set_pct(cred, sizeof(cred), p, (size_t)(at - p));
+        if (strchr(cred, ':')) {
+            sl_set_field(n->uuid, sizeof(n->uuid), cred, strlen(cred));
+        } else if (cred[0]) {
+            char dec[192];
+            size_t dn = b64_decode(cred, strlen(cred), dec, sizeof(dec));
+            if (dn > 0 && strchr(dec, ':')) sl_set_field(n->uuid, sizeof(n->uuid), dec, dn);
+            else sl_set_field(n->uuid, sizeof(n->uuid), cred, strlen(cred));
+        }
+        p = at + 1;
+    }
+    const char *colon = memchr(p, ':', (size_t)(hp_end - p));
+    if (!colon || colon == p) return -1;
+    sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
+    char pnum[8];
+    const char *pe = colon + 1;
+    size_t pl = 0;
+    while (pe < hp_end && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum)) pnum[pl++] = *pe++;
+    pnum[pl] = '\0';
+    if (!pl || pe != hp_end) return -1;
+    n->port = sl_port_of(pnum);
+    if (!n->port) return -1;
+    if (hash) sl_set_name(n->name, sizeof(n->name), hash + 1);
+    return node_usable(n);
+}
+
+static int ss_cipher_ok(const char *uuid) {
+    const char *col = strchr(uuid, ':');
+    if (!col || col == uuid || !col[1]) return 0;
+    size_t ml = (size_t)(col - uuid);
+    return (ml == 11 && !strncmp(uuid, "aes-128-gcm", 11)) ||
+           (ml == 11 && !strncmp(uuid, "aes-256-gcm", 11)) ||
+           (ml == 22 && !strncmp(uuid, "chacha20-ietf-poly1305", 22)) ||
+           (ml == 17 && !strncmp(uuid, "chacha20-poly1305", 17)) ||
+           (ml == 23 && !strncmp(uuid, "2022-blake3-aes-128-gcm", 23)) ||
+           (ml == 23 && !strncmp(uuid, "2022-blake3-aes-256-gcm", 23)) ||
+           (ml == 29 && !strncmp(uuid, "2022-blake3-chacha20-poly1305", 29));
+}
+
+static int ss_parse_url(const char *url, struct vless_node *n) {
+    if (strncmp(url, "ss://", 5) != 0) return -1;
+    const char *p = url + 5;
+    const char *hash = strchr(p, '#');
+    const char *qmark = memchr(p, '?', (size_t)((hash ? hash : p + strlen(p)) - p));
+    const char *hp_end = qmark ? qmark : hash ? hash : p + strlen(p);
+    const char *at = memchr(p, '@', (size_t)(hp_end - p));
+
+    char full_buf[512];
+    if (!at) {
+        /* Legacy ss://base64(method:password@host:port)#name */
+        char dec[384];
+        size_t dn = b64_decode(p, (size_t)(hp_end - p), dec, sizeof(dec));
+        if (!dn || !strchr(dec, '@') || !strchr(dec, ':')) return -1;
+        snprintf(full_buf, sizeof(full_buf), "ss://%s%s", dec, qmark ? qmark : (hash ? hash : ""));
+        url = full_buf;
+    }
+
+    const char *sec = NULL;
+    size_t sec_n = 0;
+    int rc = sl_link_parse(url, "ss://", n, NULL, &sec, &sec_n);
+    if (rc) return rc;
+    snprintf(n->proto, sizeof(n->proto), "ss");
+    char cred[256];
+    sl_set_pct(cred, sizeof(cred), sec, sec_n);
+    if (strchr(cred, ':')) {
+        sl_set_field(n->uuid, sizeof(n->uuid), cred, strlen(cred));
+    } else {
+        char dec[256];
+        size_t dn = b64_decode(cred, strlen(cred), dec, sizeof(dec));
+        if (!dn || !strchr(dec, ':')) return -1;
+        sl_set_field(n->uuid, sizeof(n->uuid), dec, dn);
+    }
+    return node_usable(n);
+}
+
+static int vmess_parse_url(const char *url, struct vless_node *n);
+static int mieru_parse_url(const char *url, struct vless_node *n);
+static int hy2_parse_url(const char *url, struct vless_node *n);
+static int anytls_parse_url(const char *url, struct vless_node *n);
+
 /* The VLESS parameters of a link: flow and encryption (Xray-core's post-quantum encryption, a
  * long value, see sl_intern). The rest go to sl_link_param. */
 static int vless_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
@@ -52,9 +505,81 @@ static int vless_own(struct vless_node *n, const char *k, size_t klen, const cha
     return 1;
 }
 
-/* vless://UUID@host:port?params#name. An unusable node is not an error of the subscription: the
- * server may offer a transport the client does not support, and only that node is skipped. */
+/* vless://UUID@host:port?params#name, tt:// (TLV or canonical), https://...?d=<TLV>, socks5://,
+ * trojan://, ss://, vmess://, mieru://, mierus://, or naive+https://.
+ * An unusable node is not an error of the subscription: the server may offer a transport the client
+ * does not support, and only that node is skipped. */
 int vless_parse_url(const char *url, struct vless_node *n) {
+    if (is_tt_tlv_url(url)) {
+        size_t cnt = 0;
+        return tt_parse_tlv_multi(url, n, 1, &cnt);
+    }
+    if (!strncmp(url, "tt://", 5)) {
+        const char *sec = NULL;
+        size_t sec_n = 0;
+        int rc = sl_link_parse(url, "tt://", n, NULL, &sec, &sec_n);
+        if (rc) return rc;
+        sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+        snprintf(n->proto, sizeof(n->proto), "tt");
+        if (!n->security[0]) snprintf(n->security, sizeof(n->security), "tls");
+        if (!strcmp(n->type, "h2")) snprintf(n->type, sizeof(n->type), "tcp");
+        return node_usable(n);
+    }
+    if (!strncmp(url, "naive+https://", 14) || !strncmp(url, "naive://", 8)) {
+        const char *scheme = !strncmp(url, "naive+https://", 14) ? "naive+https://" : "naive://";
+        const char *sec = NULL;
+        size_t sec_n = 0;
+        int rc = sl_link_parse(url, scheme, n, NULL, &sec, &sec_n);
+        if (rc) return rc;
+        sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+        snprintf(n->proto, sizeof(n->proto), "naive");
+        if (!n->security[0]) snprintf(n->security, sizeof(n->security), "tls");
+        if (!n->sni[0] && sl_host_is_name(n->host)) snprintf(n->sni, sizeof(n->sni), "%s", n->host);
+        if (!strcmp(n->type, "h2")) snprintf(n->type, sizeof(n->type), "tcp");
+        return node_usable(n);
+    }
+    if (!strncmp(url, "trojan://", 9)) {
+        const char *sec = NULL;
+        size_t sec_n = 0;
+        int rc = sl_link_parse(url, "trojan://", n, NULL, &sec, &sec_n);
+        if (rc) return rc;
+        sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+        snprintf(n->proto, sizeof(n->proto), "trojan");
+        if (!n->security[0]) snprintf(n->security, sizeof(n->security), "tls");
+        if (!strcmp(n->security, "tls") && !n->sni[0] && sl_host_is_name(n->host))
+            snprintf(n->sni, sizeof(n->sni), "%s", n->host);
+        return node_usable(n);
+    }
+    if (!strncmp(url, "ss://", 5)) {
+        return ss_parse_url(url, n);
+    }
+    if (!strncmp(url, "vmess://", 8)) {
+        return vmess_parse_url(url, n);
+    }
+    if (!strncmp(url, "mieru://", 8) || !strncmp(url, "mierus://", 9)) {
+        return mieru_parse_url(url, n);
+    }
+    if (!strncmp(url, "hysteria2://", 12) || !strncmp(url, "hy2://", 6)) {
+        return hy2_parse_url(url, n);
+    }
+    if (!strncmp(url, "anytls://", 9)) {
+        return anytls_parse_url(url, n);
+    }
+    if (!strncmp(url, "finiteproto://", 14) || !strncmp(url, "fp://", 5)) {
+        const char *scheme = !strncmp(url, "finiteproto://", 14) ? "finiteproto://" : "fp://";
+        const char *sec = NULL;
+        size_t sec_n = 0;
+        int rc = sl_link_parse(url, scheme, n, vless_own, &sec, &sec_n);
+        if (rc) return rc;
+        snprintf(n->proto, sizeof(n->proto), "vless");
+        snprintf(n->type, sizeof(n->type), "xhttp");
+        snprintf(n->mode, sizeof(n->mode), "finiteproto");
+        if (!n->security[0]) snprintf(n->security, sizeof(n->security), "tls");
+        return node_usable(n);
+    }
+    if (!strncmp(url, "socks5://", 9) || !strncmp(url, "socks://", 8)) {
+        return socks_parse_url(url, n);
+    }
     /* Omitted fields default to type=tcp and security=none (sl_link_parse, node_usable).
      * security=none is plain VLESS over TCP, without TLS: supported, and sensible inside a
      * trusted network or over an already protected channel. */
@@ -68,7 +593,15 @@ int vless_parse_url(const char *url, struct vless_node *n) {
  * (links, Xray, sing-box, Clash) goes through it, so a node cannot be usable in one form and
  * unusable in another. */
 static int node_usable(struct vless_node *n) {
-    if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
+    int def_tls = !strcmp(n->proto, "tt") || !strcmp(n->proto, "naive") || !strcmp(n->proto, "trojan") ||
+                  !strcmp(n->proto, "hy2") || !strcmp(n->proto, "anytls");
+    if (!n->security[0]) {
+        snprintf(n->security, sizeof(n->security), "%s", def_tls ? "tls" : "none");
+    }
+    if ((!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive") || !strcmp(n->proto, "hy2")) &&
+        (!n->type[0] || !strcmp(n->type, "h2"))) {
+        snprintf(n->type, sizeof(n->type), "tcp");
+    }
 
     /* flow=xtls-rprx-vision-udp443 is Vision with UDP to port 443 allowed: without the suffix
      * Xray's client refuses UDP/443 over Vision ("XTLS rejected UDP/443 traffic") to push QUIC
@@ -81,6 +614,73 @@ static int node_usable(struct vless_node *n) {
         return 1;
     }
     if (sl_link_usable_pre(n)) return 1;
+
+    if (!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive") || !strcmp(n->proto, "mieru")) {
+        const char *col = strchr(n->uuid, ':');
+        if (!col || col == n->uuid || !col[1]) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "%s: missing username or password", n->proto);
+            return 1;
+        }
+        return sl_link_usable_post(n);
+    }
+    if (!strcmp(n->proto, "trojan") || !strcmp(n->proto, "hy2") || !strcmp(n->proto, "anytls")) {
+        if (!n->uuid[0]) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "%s: password is empty", n->proto);
+            return 1;
+        }
+        return sl_link_usable_post(n);
+    }
+    if (!strcmp(n->proto, "ss")) {
+        if (!ss_cipher_ok(n->uuid)) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "ss: unsupported cipher");
+            return 1;
+        }
+        return sl_link_usable_post(n);
+    }
+    if (!strcmp(n->proto, "socks5")) {
+        if (n->uuid[0]) {
+            const char *col = strchr(n->uuid, ':');
+            if (!col || col == n->uuid) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "socks5: invalid user:password");
+                return 1;
+            }
+        }
+        return sl_link_usable_post(n);
+    }
+    if (!strcmp(n->proto, "vmess")) {
+        const char *id = n->uuid;
+        const char *col = strchr(n->uuid, ':');
+        if (col) {
+            size_t cl = (size_t)(col - n->uuid);
+            if (!((cl == 4 && !strncmp(n->uuid, "auto", 4)) ||
+                  (cl == 11 && !strncmp(n->uuid, "aes-128-gcm", 11)) ||
+                  (cl == 17 && !strncmp(n->uuid, "chacha20-poly1305", 17)) ||
+                  (cl == 22 && !strncmp(n->uuid, "chacha20-ietf-poly1305", 22)) ||
+                  (cl == 4 && !strncmp(n->uuid, "none", 4)) ||
+                  (cl == 4 && !strncmp(n->uuid, "zero", 4)))) {
+                snprintf(n->skip_reason, sizeof(n->skip_reason), "vmess: unsupported cipher");
+                return 1;
+            }
+            id = col + 1;
+        }
+        switch (vless_uuid_form(id)) {
+        case VLESS_UUID_EMPTY:
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "id is empty");
+            return 1;
+        case VLESS_UUID_GAP:
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "id: 31 characters, need a UUID");
+            return 1;
+        case VLESS_UUID_TOOLONG:
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "id longer than a UUID");
+            return 1;
+        case VLESS_UUID_NOTHEX:
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "UUID with an invalid character");
+            return 1;
+        default:
+            break;
+        }
+        return sl_link_usable_post(n);
+    }
 
     /* The user id, by Xray's rule (vless_uuid_form): a hex UUID of 32-36 characters, or a
      * string of up to 30 characters that is hashed into a UUID. Panels use both, and
@@ -431,6 +1031,9 @@ static int xh_obj(struct sj *j, struct xh_set *s, struct xh_set *ex, int *ex_on,
             if (*j->p == '{') xray_headers(j, &s->h, 1);
             else { sj_skip(j); s->h.bad = 1; }
         }
+        else if (!strcasecmp(k, "fp_id") || !strcasecmp(k, "client_id")) { if (sj_str(j, s->n.fp_id, sizeof s->n.fp_id)) return -1; }
+        else if (!strcasecmp(k, "fp_secret")) { if (sj_str(j, s->n.fp_secret, sizeof s->n.fp_secret)) return -1; }
+        else if (!strcasecmp(k, "fp_method")) { if (sj_str(j, s->n.fp_method, sizeof s->n.fp_method)) return -1; }
         else if (ex && !strcasecmp(k, "extra")) {
             free(ex->dl);
             memset(ex, 0, sizeof *ex);
@@ -450,6 +1053,9 @@ static void xh_apply(struct vless_node *n, const struct xh_set *s) {
         snprintf(n->headers, sizeof(n->headers), "%s", s->h.headers);
         n->headers_bad = s->h.bad;
     }
+    if (s->n.fp_id[0]) snprintf(n->fp_id, sizeof(n->fp_id), "%s", s->n.fp_id);
+    if (s->n.fp_secret[0]) snprintf(n->fp_secret, sizeof(n->fp_secret), "%s", s->n.fp_secret);
+    if (s->n.fp_method[0]) snprintf(n->fp_method, sizeof(n->fp_method), "%s", s->n.fp_method);
     sl_xh_done(n, &s->a);
     if (s->dl) sl_dl_done(n, s->dl);
 }
@@ -731,6 +1337,458 @@ static long sj_num(struct sj *j) {
     if (*j->p == '"') sj_str(j, b, sizeof b);
     else { size_t i = 0; while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof b) b[i++] = *j->p++; b[i] = 0; if (!i) sj_skip(j); }
     return atol(b);
+}
+
+static int vmess_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
+    if ((klen == 10 && !strncmp(k, "encryption", 10)) || (klen == 3 && !strncmp(k, "scy", 3))) {
+        char scy[32];
+        sl_set_pct(scy, sizeof(scy), v, vlen);
+        if (scy[0] && strcmp(scy, "auto") != 0 && strcmp(scy, "aes-128-gcm") != 0 && !strchr(n->uuid, ':')) {
+            char tmp[168];
+            snprintf(tmp, sizeof(tmp), "%s:%s", scy, n->uuid);
+            sl_set_field(n->uuid, sizeof(n->uuid), tmp, strlen(tmp));
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int vmess_parse_url(const char *url, struct vless_node *n) {
+    if (strncmp(url, "vmess://", 8) != 0) return -1;
+    const char *p = url + 8;
+    const char *hash = strchr(p, '#');
+    const char *qmark = memchr(p, '?', (size_t)((hash ? hash : p + strlen(p)) - p));
+    const char *hp_end = qmark ? qmark : hash ? hash : p + strlen(p);
+    const char *at = memchr(p, '@', (size_t)(hp_end - p));
+
+    if (at) {
+        const char *sec = NULL;
+        size_t sec_n = 0;
+        int rc = sl_link_parse(url, "vmess://", n, vmess_own, &sec, &sec_n);
+        if (rc) return rc;
+        snprintf(n->proto, sizeof(n->proto), "vmess");
+        char cred[128];
+        sl_set_pct(cred, sizeof(cred), sec, sec_n);
+        if (n->uuid[0] && strchr(n->uuid, ':') && !strchr(cred, ':')) {
+            /* vmess_own already stored "<scy>:<uuid>" into n->uuid */
+            size_t cl = (size_t)(strchr(n->uuid, ':') - n->uuid);
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%.*s:%s", (int)cl, n->uuid, cred);
+            sl_set_field(n->uuid, sizeof(n->uuid), tmp, strlen(tmp));
+        } else {
+            sl_set_field(n->uuid, sizeof(n->uuid), cred, strlen(cred));
+        }
+        return node_usable(n);
+    }
+
+    /* V2RayN base64 JSON format: vmess://<base64_json> */
+    char dec[2048];
+    size_t dn = b64_decode(p, (size_t)(hp_end - p), dec, sizeof(dec));
+    if (!dn) return -1;
+    struct sj j = { dec };
+    sj_ws(&j);
+    if (*j.p != '{') return -1;
+
+    memset(n, 0, sizeof(*n));
+    snprintf(n->proto, sizeof(n->proto), "vmess");
+    snprintf(n->type, sizeof(n->type), "tcp");
+    snprintf(n->security, sizeof(n->security), "none");
+
+    char id[64] = "", scy[32] = "", net[32] = "", hdr_type[32] = "", host_hdr[256] = "", path_str[256] = "", svc_str[128] = "", tls_str[32] = "";
+    int first = 1;
+    char k[64];
+    while (sj_obj_key(&j, &first, k, sizeof(k)) == 0) {
+        sj_ws(&j);
+        if (!strcmp(k, "ps") && *j.p == '"') {
+            sj_str(&j, n->name, sizeof(n->name));
+            sl_utf8_trim_tail(n->name);
+        } else if (!strcmp(k, "add") && *j.p == '"') {
+            sj_str(&j, n->host, sizeof(n->host));
+        } else if (!strcmp(k, "port")) {
+            n->port = port_of_num(sj_num(&j));
+        } else if (!strcmp(k, "id") && *j.p == '"') {
+            sj_str(&j, id, sizeof(id));
+        } else if ((!strcmp(k, "scy") || !strcmp(k, "security")) && *j.p == '"') {
+            sj_str(&j, scy, sizeof(scy));
+        } else if (!strcmp(k, "net") && *j.p == '"') {
+            sj_str(&j, net, sizeof(net));
+        } else if (!strcmp(k, "type") && *j.p == '"') {
+            sj_str(&j, hdr_type, sizeof(hdr_type));
+        } else if (!strcmp(k, "host") && *j.p == '"') {
+            sj_str(&j, host_hdr, sizeof(host_hdr));
+        } else if (!strcmp(k, "path") && *j.p == '"') {
+            sj_str(&j, path_str, sizeof(path_str));
+        } else if (!strcmp(k, "serviceName") && *j.p == '"') {
+            sj_str(&j, svc_str, sizeof(svc_str));
+        } else if (!strcmp(k, "tls") && *j.p == '"') {
+            sj_str(&j, tls_str, sizeof(tls_str));
+        } else if (!strcmp(k, "sni") && *j.p == '"') {
+            sj_str(&j, n->sni, sizeof(n->sni));
+        } else if (!strcmp(k, "fp") && *j.p == '"') {
+            sj_str(&j, n->fp, sizeof(n->fp));
+        } else if (!strcmp(k, "allowInsecure") || !strcmp(k, "insecure")) {
+            if (*j.p == '"') {
+                char iv[16] = "";
+                sj_str(&j, iv, sizeof(iv));
+                if (sl_truthy(iv)) n->allow_insecure = 1;
+            } else if (sj_bool(&j)) {
+                n->allow_insecure = 1;
+            }
+        } else {
+            sj_skip(&j);
+        }
+    }
+
+    if (!n->host[0] || !n->port) return -1;
+    if (hash && !n->name[0]) sl_set_name(n->name, sizeof(n->name), hash + 1);
+
+    if (scy[0] && strcmp(scy, "auto") != 0 && strcmp(scy, "aes-128-gcm") != 0)
+        snprintf(n->uuid, sizeof(n->uuid), "%s:%s", scy, id);
+    else
+        snprintf(n->uuid, sizeof(n->uuid), "%s", id);
+
+    if (net[0]) {
+        if (!strcmp(net, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
+        else if (!strcmp(net, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
+        else if (!strcmp(net, "splithttp")) snprintf(n->type, sizeof(n->type), "xhttp");
+        else sl_set_field(n->type, sizeof(n->type), net, strlen(net));
+    }
+    if (!strcmp(n->type, "tcp") && !strcmp(hdr_type, "http")) n->tcp_http = 1;
+    if (!strcmp(n->type, "grpc")) {
+        const char *sv = svc_str[0] ? svc_str : path_str;
+        sl_set_field(n->service, sizeof(n->service), sv, strlen(sv));
+    } else {
+        if (path_str[0]) sl_set_field(n->path, sizeof(n->path), path_str, strlen(path_str));
+        if (host_hdr[0]) sl_set_field(n->http_host, sizeof(n->http_host), host_hdr, strlen(host_hdr));
+    }
+    if (!strcmp(tls_str, "tls") || sl_truthy(tls_str)) {
+        snprintf(n->security, sizeof(n->security), "tls");
+        if (!n->sni[0]) {
+            if (host_hdr[0] && sl_host_is_name(host_hdr)) sl_set_field(n->sni, sizeof(n->sni), host_hdr, strlen(host_hdr));
+            else if (sl_host_is_name(n->host)) sl_set_field(n->sni, sizeof(n->sni), n->host, strlen(n->host));
+        }
+    }
+    return node_usable(n);
+}
+
+static int pb_varint(const unsigned char **p, const unsigned char *end, uint64_t *val) {
+    uint64_t v = 0;
+    int shift = 0;
+    while (*p < end && shift < 64) {
+        unsigned char b = *(*p)++;
+        v |= (uint64_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) { *val = v; return 0; }
+        shift += 7;
+    }
+    return -1;
+}
+
+static int mieru_parse_pb(const unsigned char *buf, size_t len, struct vless_node *n) {
+    const unsigned char *p = buf, *end = buf + len;
+    char user[64] = "", pass[64] = "", host[256] = "";
+    uint16_t tcp_port = 0;
+    int saw_udp = 0;
+
+    while (p < end) {
+        uint64_t tag = 0, slen = 0;
+        if (pb_varint(&p, end, &tag) < 0) return -1;
+        uint32_t fn = (uint32_t)(tag >> 3), wt = (uint32_t)(tag & 7);
+        if (wt == 0) {
+            uint64_t v = 0;
+            if (pb_varint(&p, end, &v) < 0) return -1;
+        } else if (wt == 2) {
+            if (pb_varint(&p, end, &slen) < 0 || slen > (uint64_t)(end - p)) return -1;
+            const unsigned char *sp = p, *send = p + slen;
+            p = send;
+            if (fn == 1) {
+                sl_set_field(n->name, sizeof(n->name), (const char *)sp, (size_t)slen);
+                sl_utf8_trim_tail(n->name);
+            } else if (fn == 2) {
+                while (sp < send) {
+                    uint64_t utag = 0, ulen = 0;
+                    if (pb_varint(&sp, send, &utag) < 0) return -1;
+                    if ((utag & 7) == 2) {
+                        if (pb_varint(&sp, send, &ulen) < 0 || ulen > (uint64_t)(send - sp)) return -1;
+                        if ((utag >> 3) == 1) sl_set_field(user, sizeof(user), (const char *)sp, (size_t)ulen);
+                        else if ((utag >> 3) == 2) sl_set_field(pass, sizeof(pass), (const char *)sp, (size_t)ulen);
+                        sp += ulen;
+                    } else if ((utag & 7) == 0) {
+                        uint64_t uv = 0;
+                        if (pb_varint(&sp, send, &uv) < 0) return -1;
+                    } else return -1;
+                }
+            } else if (fn == 3 && !tcp_port) {
+                char ip[128] = "", dom[256] = "";
+                while (sp < send) {
+                    uint64_t stag = 0, sblen = 0;
+                    if (pb_varint(&sp, send, &stag) < 0) return -1;
+                    if ((stag & 7) == 2) {
+                        if (pb_varint(&sp, send, &sblen) < 0 || sblen > (uint64_t)(send - sp)) return -1;
+                        const unsigned char *bp = sp, *bend = sp + sblen;
+                        sp = bend;
+                        if ((stag >> 3) == 1) sl_set_field(ip, sizeof(ip), (const char *)bp, (size_t)sblen);
+                        else if ((stag >> 3) == 2) sl_set_field(dom, sizeof(dom), (const char *)bp, (size_t)sblen);
+                        else if ((stag >> 3) == 3) {
+                            uint16_t bport = 0;
+                            int bproto = 1; /* default TCP */
+                            while (bp < bend) {
+                                uint64_t ptag = 0, pv = 0;
+                                if (pb_varint(&bp, bend, &ptag) < 0) return -1;
+                                if ((ptag & 7) == 0) {
+                                    if (pb_varint(&bp, bend, &pv) < 0) return -1;
+                                    if ((ptag >> 3) == 1 && pv > 0 && pv < 65536) bport = (uint16_t)pv;
+                                    else if ((ptag >> 3) == 2) bproto = (int)pv;
+                                } else if ((ptag & 7) == 2) {
+                                    if (pb_varint(&bp, bend, &pv) < 0 || pv > (uint64_t)(bend - bp)) return -1;
+                                    if ((ptag >> 3) == 3 && !bport) {
+                                        char rstr[32];
+                                        sl_set_field(rstr, sizeof(rstr), (const char *)bp, (size_t)pv);
+                                        long rp = atol(rstr);
+                                        if (rp > 0 && rp < 65536) bport = (uint16_t)rp;
+                                    }
+                                    bp += pv;
+                                } else return -1;
+                            }
+                            if (bport) {
+                                if (bproto == 1 && !tcp_port) tcp_port = bport;
+                                else if (bproto == 2) saw_udp = 1;
+                            }
+                        }
+                    } else if ((stag & 7) == 0) {
+                        uint64_t sv = 0;
+                        if (pb_varint(&sp, send, &sv) < 0) return -1;
+                    } else return -1;
+                }
+                if (dom[0] || ip[0]) snprintf(host, sizeof(host), "%s", dom[0] ? dom : ip);
+            }
+        } else if (wt == 1 && (size_t)(end - p) >= 8) {
+            p += 8;
+        } else if (wt == 5 && (size_t)(end - p) >= 4) {
+            p += 4;
+        } else {
+            return -1;
+        }
+    }
+    if (!host[0] || (!tcp_port && !saw_udp)) return -1;
+    snprintf(n->proto, sizeof(n->proto), "mieru");
+    snprintf(n->type, sizeof(n->type), "tcp");
+    snprintf(n->security, sizeof(n->security), "none");
+    sl_set_field(n->host, sizeof(n->host), host, strlen(host));
+    if (user[0] || pass[0]) snprintf(n->uuid, sizeof(n->uuid), "%s:%s", user, pass);
+    if (!tcp_port && saw_udp) {
+        n->port = 1;
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "mieru: UDP transport is not supported");
+        return 1;
+    }
+    n->port = tcp_port;
+    return node_usable(n);
+}
+
+static int mieru_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
+    if (klen == 8 && !strncmp(k, "protocol", 8)) {
+        char pr[16];
+        sl_set_pct(pr, sizeof(pr), v, vlen);
+        if (!strcasecmp(pr, "UDP")) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "mieru: UDP transport is not supported");
+        }
+        return 1;
+    }
+    if (klen == 7 && !strncmp(k, "profile", 7)) {
+        if (!n->name[0]) sl_set_pct(n->name, sizeof(n->name), v, vlen);
+        return 1;
+    }
+    return 0;
+}
+
+static int mieru_parse_url(const char *url, struct vless_node *n) {
+    const char *scheme = !strncmp(url, "mierus://", 9) ? "mierus://" :
+                         !strncmp(url, "mieru://", 8) ? "mieru://" : NULL;
+    if (!scheme) return -1;
+    size_t scl = strlen(scheme);
+    const char *p = url + scl;
+    const char *hash = strchr(p, '#');
+    const char *qmark = memchr(p, '?', (size_t)((hash ? hash : p + strlen(p)) - p));
+    const char *hp_end = qmark ? qmark : hash ? hash : p + strlen(p);
+    const char *at = memchr(p, '@', (size_t)(hp_end - p));
+
+    if (!at && !strcmp(scheme, "mieru://")) {
+        unsigned char dec[2048];
+        size_t dn = b64_decode(p, (size_t)(hp_end - p), (char *)dec, sizeof(dec));
+        if (!dn) return -1;
+        memset(n, 0, sizeof(*n));
+        int rc = mieru_parse_pb(dec, dn, n);
+        if (rc >= 0 && hash && !n->name[0]) sl_set_name(n->name, sizeof(n->name), hash + 1);
+        return rc;
+    }
+    if (!at) return -1;
+
+    /* Support mierus://user:pass@host?port=1234&protocol=TCP#name where port is in query */
+    char rewritten[1024];
+    const char *colon_after_at = memchr(at + 1, ':', (size_t)(hp_end - (at + 1)));
+    if (!colon_after_at && qmark) {
+        const char *qp = strstr(qmark + 1, "port=");
+        if (qp && qp > qmark && (qp[-1] == '?' || qp[-1] == '&')) {
+            long port_val = atol(qp + 5);
+            if (port_val > 0 && port_val < 65536) {
+                int nw = snprintf(rewritten, sizeof(rewritten), "%.*s:%ld%s",
+                                  (int)(hp_end - url), url, port_val, hp_end);
+                if (nw < 0 || (size_t)nw >= sizeof(rewritten)) return -1;
+                url = rewritten;
+            }
+        }
+    }
+
+    const char *sec = NULL;
+    size_t sec_n = 0;
+    int rc = sl_link_parse(url, scheme, n, mieru_own, &sec, &sec_n);
+    if (rc) return rc;
+    snprintf(n->proto, sizeof(n->proto), "mieru");
+    sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+    if (n->skip_reason[0]) return 1;
+    return node_usable(n);
+}
+
+static int hy2_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
+    if (klen == 4 && !strncmp(k, "peer", 4)) {
+        if (!n->sni[0]) sl_set_pct(n->sni, sizeof(n->sni), v, vlen);
+        return 1;
+    }
+    if (klen == 9 && !strncasecmp(k, "pinsha256", 9)) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) { sl_add_pins(n, d, 0); free(d); } else n->pcs = SL_BAD_PIN;
+        return 1;
+    }
+    if (klen == 4 && !strncmp(k, "obfs", 4)) {
+        char ob[32];
+        sl_set_pct(ob, sizeof(ob), v, vlen);
+        if (ob[0] && strcasecmp(ob, "salamander") != 0 && strcasecmp(ob, "none") != 0) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "hy2: unsupported obfs");
+        }
+        return 1;
+    }
+    if (klen == 13 && (!strncmp(k, "obfs-password", 13) || !strncmp(k, "obfs_password", 13))) {
+        sl_set_pct(n->obfs_pass, sizeof(n->obfs_pass), v, vlen);
+        return 1;
+    }
+    if (klen == 5 && (!strncmp(k, "mport", 5) || !strncmp(k, "ports", 5))) {
+        sl_set_pct(n->mport, sizeof(n->mport), v, vlen);
+        return 1;
+    }
+    return 0;
+}
+
+static int hy2_parse_url(const char *url, struct vless_node *n) {
+    const char *scheme = !strncmp(url, "hysteria2://", 12) ? "hysteria2://" :
+                         !strncmp(url, "hy2://", 6) ? "hy2://" : NULL;
+    if (!scheme) return -1;
+    size_t scl = strlen(scheme);
+    const char *p = url + scl;
+    const char *hash = strchr(p, '#');
+    const char *hp_end = hash ? hash : p + strlen(p);
+    const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
+    const char *auth_end = qmark ? qmark : hp_end;
+    const char *at = memchr(p, '@', (size_t)(auth_end - p));
+    if (!at) return -1;
+
+    /* Strip trailing '/' after host[:port] and extract port-hopping ranges if present in authority */
+    const char *host_start = at + 1;
+    const char *host_end = auth_end;
+    if (host_end > host_start && host_end[-1] == '/') host_end--;
+    const char *colon = memchr(host_start, ':', (size_t)(host_end - host_start));
+
+    char rewritten[2048];
+    char auth_mport[64] = "";
+    if (!colon) {
+        int nw = snprintf(rewritten, sizeof(rewritten), "%.*s:443%s",
+                          (int)(host_end - url), url, auth_end);
+        if (nw < 0 || (size_t)nw >= sizeof(rewritten)) return -1;
+        url = rewritten;
+    } else {
+        const char *ps = colon + 1;
+        size_t plen = (size_t)(host_end - ps);
+        const char *sep = NULL;
+        for (size_t i = 0; i < plen; i++) {
+            if (ps[i] == ',' || ps[i] == '-') { sep = ps + i; break; }
+        }
+        if (sep || host_end != auth_end) {
+            size_t first_len = sep ? (size_t)(sep - ps) : plen;
+            if (sep && plen < sizeof(auth_mport)) {
+                memcpy(auth_mport, ps, plen);
+                auth_mport[plen] = '\0';
+            }
+            int nw = snprintf(rewritten, sizeof(rewritten), "%.*s:%.*s%s",
+                              (int)(colon - url), url, (int)first_len, ps, auth_end);
+            if (nw < 0 || (size_t)nw >= sizeof(rewritten)) return -1;
+            url = rewritten;
+        }
+    }
+
+    const char *sec = NULL;
+    size_t sec_n = 0;
+    int rc = sl_link_parse(url, scheme, n, hy2_own, &sec, &sec_n);
+    if (rc) return rc;
+    snprintf(n->proto, sizeof(n->proto), "hy2");
+    snprintf(n->type, sizeof(n->type), "quic");
+    snprintf(n->security, sizeof(n->security), "tls");
+    sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+    if (auth_mport[0] && !n->mport[0]) {
+        snprintf(n->mport, sizeof(n->mport), "%s", auth_mport);
+    }
+    if (n->skip_reason[0]) return 1;
+    return node_usable(n);
+}
+
+static int anytls_own(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
+    if (klen == 4 && !strncmp(k, "peer", 4)) {
+        if (!n->sni[0]) sl_set_pct(n->sni, sizeof(n->sni), v, vlen);
+        return 1;
+    }
+    if (klen == 9 && !strncasecmp(k, "pinsha256", 9)) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) { sl_add_pins(n, d, 0); free(d); } else n->pcs = SL_BAD_PIN;
+        return 1;
+    }
+    return 0;
+}
+
+static int anytls_parse_url(const char *url, struct vless_node *n) {
+    if (strncmp(url, "anytls://", 9) != 0) return -1;
+    const char *p = url + 9;
+    const char *hash = strchr(p, '#');
+    const char *hp_end = hash ? hash : p + strlen(p);
+    const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
+    const char *auth_end = qmark ? qmark : hp_end;
+    const char *at = memchr(p, '@', (size_t)(auth_end - p));
+    if (!at) return -1;
+
+    const char *host_start = at + 1;
+    const char *host_end = auth_end;
+    if (host_end > host_start && host_end[-1] == '/') host_end--;
+    const char *colon = memchr(host_start, ':', (size_t)(host_end - host_start));
+
+    char rewritten[2048];
+    if (!colon) {
+        int nw = snprintf(rewritten, sizeof(rewritten), "%.*s:443%s",
+                          (int)(host_end - url), url, auth_end);
+        if (nw < 0 || (size_t)nw >= sizeof(rewritten)) return -1;
+        url = rewritten;
+    } else if (host_end != auth_end) {
+        int nw = snprintf(rewritten, sizeof(rewritten), "%.*s%s",
+                          (int)(host_end - url), url, auth_end);
+        if (nw < 0 || (size_t)nw >= sizeof(rewritten)) return -1;
+        url = rewritten;
+    }
+
+    const char *sec = NULL;
+    size_t sec_n = 0;
+    int rc = sl_link_parse(url, "anytls://", n, anytls_own, &sec, &sec_n);
+    if (rc) return rc;
+    snprintf(n->proto, sizeof(n->proto), "anytls");
+    snprintf(n->type, sizeof(n->type), "tcp");
+    snprintf(n->security, sizeof(n->security), "tls");
+    sl_set_pct(n->uuid, sizeof(n->uuid), sec, sec_n);
+    if (n->skip_reason[0]) return 1;
+    return node_usable(n);
 }
 
 struct sb_ws { long ed; char ed_hdr[40]; };
@@ -1576,8 +2634,8 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                  * A node name that ends like a scheme ("…#Express" before "ss://") still
                  * splits right: only the bytes before "://" are compared. */
                 static const char *const schemes[] = {
-                    "hysteria2", "wireguard", "hysteria", "trojan", "vmess",
-                    "vless", "tuic", "hy2", "ssr", "ss"
+                    "finiteproto", "naive+https", "hysteria2", "wireguard", "hysteria", "trojan", "socks5", "mierus",
+                    "anytls", "mieru", "vmess", "vless", "naive", "socks", "tuic", "hy2", "ssr", "fp", "tt", "ss"
                 };
                 const char *s2 = NULL;
                 for (size_t si = 0; si < sizeof(schemes) / sizeof(*schemes); si++) {
@@ -1637,7 +2695,34 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                                    ? NULL : glued_tail(line, line + len);
             if (glue) {
                 glue_note(st, glue, line + len);
-            } else if (!strncmp(line, "vless://", 8)) {
+            } else if (is_tt_tlv_url(line)) {
+                struct vless_node tnodes[16];
+                size_t tn = 0;
+                int rc = tt_parse_tlv_multi(line, tnodes, 16, &tn);
+                if (rc < 0) {
+                    if (st) st->foreign++;
+                } else {
+                    for (size_t ti = 0; ti < tn; ti++) {
+                        if (!tnodes[ti].skip_reason[0] && n < max) { sl_node_ok(&tnodes[ti]); out[n++] = tnodes[ti]; }
+                        else if (!tnodes[ti].skip_reason[0]) sl_skip_node(st, &tnodes[ti], "more nodes than fit");
+                        else sl_skip_node(st, &tnodes[ti], tnodes[ti].skip_reason);
+                    }
+                }
+            } else if (!strncmp(line, "ss://", 5) || !strncmp(line, "vmess://", 8) ||
+                       !strncmp(line, "mieru://", 8) || !strncmp(line, "mierus://", 9)) {
+                struct vless_node node;
+                int rc = vless_parse_url(line, &node);
+                if (rc < 0) {
+                    if (st) st->foreign++;
+                } else if (rc == 0 && n < max) { sl_node_ok(&node); out[n++] = node; }
+                else if (rc == 0) sl_skip_node(st, &node, "more nodes than fit");
+                else sl_skip_node(st, &node, node.skip_reason);
+            } else if (!strncmp(line, "vless://", 8) || !strncmp(line, "tt://", 5) ||
+                       !strncmp(line, "finiteproto://", 14) || !strncmp(line, "fp://", 5) ||
+                       !strncmp(line, "trojan://", 9) || !strncmp(line, "naive+https://", 14) ||
+                       !strncmp(line, "naive://", 8) || !strncmp(line, "hysteria2://", 12) ||
+                       !strncmp(line, "hy2://", 6) || !strncmp(line, "anytls://", 9) ||
+                       !strncmp(line, "socks5://", 9) || !strncmp(line, "socks://", 8)) {
                 struct vless_node node;
                 int rc = vless_parse_url(line, &node);
                 /* rc 1: the parser named the reason. rc -1: the link did not parse at all
@@ -1671,15 +2756,34 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     if (looks_clash(p)) return raw;
     if (strstr(raw, "://")) return raw;
     b64_decode(raw, raw_n, dec, dec_n);
+    const char *dp = dec;
+    while (*dp == ' ' || *dp == '\t' || *dp == '\n' || *dp == '\r') dp++;
+    if (*dp && *dp != '[' && *dp != '{' && !looks_clash(dp) && !strstr(dp, "://")) {
+        size_t dlen = strlen(dp);
+        char *tmp = malloc(dlen + 1);
+        if (tmp) {
+            memcpy(tmp, dp, dlen + 1);
+            b64_decode(tmp, dlen, dec, dec_n);
+            free(tmp);
+        }
+    }
     return dec;
 }
 
-/* How many times "vless" occurs in text, in any case: every VLESS node has it in its own text
- * (vless://, "protocol": "vless", "type": "vless", type: vless), so this bounds the node count. */
+/* How many times proxy nodes occur in text, in any case: bounds the node count for links,
+ * Xray/sing-box JSON, and Clash YAML. */
 static size_t count_vless(const char *text) {
     size_t n = 0;
-    for (const char *q = text; *q; q++)
-        if ((*q == 'v' || *q == 'V') && !strncasecmp(q, "vless", 5)) n++;
+    for (const char *q = text; *q; q++) {
+        if ((*q == 'v' || *q == 'V') && (!strncasecmp(q, "vless", 5) || !strncasecmp(q, "vmess", 5))) n++;
+        else if (!strncmp(q, "tt://", 5) || !strncasecmp(q, "trusttunnel", 11)) n += 8;
+        else if (!strncmp(q, "?d=", 3) || !strncmp(q, "&d=", 3)) n += 8;
+        else if (!strncasecmp(q, "trojan", 6) || !strncmp(q, "ss://", 5) || !strncasecmp(q, "shadowsocks", 11)) n++;
+        else if (!strncasecmp(q, "mierus", 6) || !strncasecmp(q, "mieru", 5)) n++;
+        else if (!strncasecmp(q, "hysteria2", 9) || !strncasecmp(q, "hy2", 3) || !strncasecmp(q, "anytls", 6)) n++;
+        else if (!strncasecmp(q, "finiteproto", 11) || !strncmp(q, "fp://", 5)) n++;
+        else if (!strncasecmp(q, "naive", 5) || !strncasecmp(q, "socks", 5)) n++;
+    }
     return n;
 }
 

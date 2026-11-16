@@ -68,6 +68,8 @@
 /* The node as the transport sees it: only what concerns the connection. The pointers point into
  * the parsed node (struct vless_node), no copies: the node outlives every connection to it. */
 struct tr_node {
+    const char *proto;         /* vless | tt | socks5 | trojan | ss | naive */
+    const char *uuid;          /* secret / user:pass / method:password */
     const char *host;
     uint16_t port;
     const char *type;          /* tcp | grpc | xhttp | ws | httpupgrade */
@@ -90,6 +92,8 @@ struct tr_node {
     uint16_t pad_from, pad_to;
     /* xhttp packet-up POST body limit (see vless_node.post_from). post_to 0: not announced. */
     uint32_t post_from, post_to;
+    const char *obfs_pass;
+    const char *mport;
     /* Reality: ML-DSA-65 public key that verifies the certificate signature, base64url (1952
      * bytes decoded), or NULL. Xray's mldsa65Verify, `pqv` in the link. */
     const char *pqv;
@@ -98,6 +102,7 @@ struct tr_node {
      * NULL when absent. insecure comes from --insecure, not from the subscription. */
     const char *pcs, *pks, *vcn;
     int insecure;
+    int record_fragment;
     /* security=tls: ECHConfigList in base64 (Xray echConfigList, `ech=` in the link), or NULL. */
     const char *ech;
     /* VLESS encryption: the node's `encryption` string as is (mlkem768x25519plus...), or NULL for
@@ -105,6 +110,11 @@ struct tr_node {
     const char *encryption;
     const char *xhx;
     const char *fm;
+    const char *fp_id;
+    const char *fp_secret;
+    const char *fp_method;
+    uint32_t fp_chunk;
+    uint8_t fp_conc;
     const struct tr_node *dl;
 };
 
@@ -136,6 +146,10 @@ struct grpc_de {
     unsigned char pb[8];         /* protobuf field tag and length */
     unsigned char pb_n;
     uint32_t field_left;         /* bytes left of the bytes field inside the message */
+    uint8_t naive;               /* 1: NaiveProxy 8-frame padding active on stream */
+    uint8_t naive_tx;            /* NaiveProxy padded frames written so far (0..8) */
+    uint8_t naive_rx;            /* NaiveProxy padded frames read so far (0..8) */
+    uint8_t naive_pad_left;      /* unread padding bytes trailing current Naive frame */
 };
 
 /* xhttp mode. It decides how many HTTP requests one connection carries and how they split the
@@ -343,9 +357,13 @@ struct security_ops {
 
 /* A connection to a node: the main link, the transport over it and its state. xhttp has no main
  * link: it keeps its own connections in xh, which shares the memory of the others. */
+struct hy2_ctx;
+struct fp_ctx;
 struct transport {
     const struct transport_ops *fr;
     struct venc *enc;          /* VLESS encryption over the transport (trvenc.c), or NULL */
+    struct hy2_ctx *hy2;       /* Hysteria2 over QUIC v1 + HTTP/3 (trhy2.c), or NULL */
+    struct fp_ctx *fp;         /* FiniteProto v2 context, or NULL */
     const char *why;
     union {
         struct {
@@ -453,7 +471,7 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 
 /* ---- for the files of this directory ------------------------------------------------------ */
 
-extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
+extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade, tr_tt;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
 int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);
@@ -533,6 +551,7 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
 /* TCP to the node over every address of its name (trdial.c). A descriptor or a negative TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
 int tr_reach(const char *const *hosts, const uint16_t *ports, size_t n, int timeout_ms, char *ok, int *err);
+int tr_dial_udp(const char *host, uint16_t port, const char *mport, int timeout_s);
 
 /* Security by the link field: none, tls, otherwise reality (trsec.c). */
 const struct security_ops *tr_security(const char *name);

@@ -104,6 +104,8 @@ void sl_skip_node(struct vless_sub_stats *st, const struct vless_node *n, const 
 /* Pointers into the node, no copies: the node must outlive t. Certificate checks apply only to
  * security=tls: for reality these fields mean nothing. */
 static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
+    t->proto = n->proto;
+    t->uuid = n->uuid;
     t->host = n->host;
     t->port = n->port;
     t->type = n->type;
@@ -119,6 +121,8 @@ static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->pad_to = n->pad_to;
     t->post_from = n->post_from;
     t->post_to = n->post_to;
+    t->obfs_pass = n->obfs_pass;
+    t->mport = n->mport;
     t->http_host = n->http_host;
     t->headers = n->headers;
     t->pqv = n->pqv;
@@ -128,9 +132,15 @@ static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->vcn = tls ? n->vcn : NULL;
     t->ech = tls ? n->ech : NULL;
     t->insecure = tls && n->insecure;
+    t->record_fragment = n->record_fragment;
     t->encryption = n->encryption;
     t->xhx = n->xhx;
     t->fm = n->fm;
+    t->fp_id = n->fp_id;
+    t->fp_secret = n->fp_secret;
+    t->fp_method = n->fp_method;
+    t->fp_chunk = n->fp_chunk;
+    t->fp_conc = n->fp_conc;
     t->dl = NULL;
 }
 
