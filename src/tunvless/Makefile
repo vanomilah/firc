@@ -33,7 +33,7 @@ VLESS_SRC     := src/proto/vless/vldial.c src/proto/vless/client.c src/proto/vle
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
                  src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
-                 src/proto/transport/trvenc.c \
+                 src/proto/transport/trvenc.c src/proto/transport/trhy2.c \
                  src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
                  src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
                  src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
@@ -123,7 +123,7 @@ FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto
               src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c
 
 UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch tscratchmatch gorandmatch
-CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch fmsdmatch
+CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch fmsdmatch hy2quicmatch
 
 test: unit-test crypto-test $(O)/tunvless
 	sh tests/tlssize.sh $(O)/tunvless
@@ -331,7 +331,7 @@ CLIENT_SRC := src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/v
               src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vlink.c src/proto/transport/fmask.c \
               src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
               src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c src/proto/transport/trws.c \
-              src/proto/transport/trpath.c src/proto/transport/trvenc.c \
+              src/proto/transport/trpath.c src/proto/transport/trvenc.c src/proto/transport/trhy2.c \
               src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/transport/xconn.c \
               src/proto/transport/trxmux.c src/proto/transport/xmux.c \
               src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
@@ -366,6 +366,10 @@ $(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c tests/fmrelay.h tests/sdp
 
 $(T)/probematch: tests/probematch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/probematch.c $(CLIENT_SRC) src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
+
+HY2_TEST_SRC := $(filter-out src/proto/transport/trhy2.c,$(CLIENT_SRC)) src/proto/transport/trdial.c
+$(T)/hy2quicmatch: tests/hy2quicmatch.c src/proto/transport/trhy2.c $(HY2_TEST_SRC) src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)
+	$(CC) $(T_CFLAGS) -o $@ tests/hy2quicmatch.c $(HY2_TEST_SRC) src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/takematch: tests/takematch.c src/proto/vless/vldial.c $(CLIENT_SRC) $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/takematch.c src/proto/vless/vldial.c $(TUNNEL_SRC) $(CLIENT_SRC) \

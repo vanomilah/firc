@@ -1138,6 +1138,1421 @@ static void node_tls(struct vless_node *n, const char *type) {
 }
 #endif
 
+#if defined(STEER_HAVE_X509WRITE)
+enum hy2_mock_mode {
+    HY2_MOCK_NO_CERT = 1,
+    HY2_MOCK_NO_CV = 2,
+    HY2_MOCK_STATUS_200_FAKE_233 = 3,
+    HY2_MOCK_OOO_SPLIT_233_OK = 4,
+};
+
+struct hy2_mock {
+    int fd;
+    enum hy2_mock_mode mode;
+    int got_1rtt;
+};
+
+static size_t hy2_put_varint(unsigned char *p, uint64_t v) {
+    if (v <= 63) { p[0] = (unsigned char)v; return 1; }
+    if (v <= 16383) {
+        p[0] = (unsigned char)(0x40u | (v >> 8));
+        p[1] = (unsigned char)v;
+        return 2;
+    }
+    p[0] = (unsigned char)(0x80u | (v >> 24));
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+    return 4;
+}
+
+static int hy2_seal_long(int fd, int ptype, const unsigned char dcid[8], const unsigned char scid[8],
+                         const unsigned char secret[32], uint64_t pn,
+                         const unsigned char *frames, size_t flen) {
+    unsigned char key[16], iv[12], hp[16], pkt[1500];
+    if (xlabel(secret, "quic key", NULL, 0, key, 16) != 0 ||
+        xlabel(secret, "quic iv",  NULL, 0, iv,  12) != 0 ||
+        xlabel(secret, "quic hp",  NULL, 0, hp,  16) != 0)
+        return -1;
+    size_t o = 0;
+    pkt[o++] = (unsigned char)(0xC0u | ((ptype & 3) << 4) | 0x01u);
+    pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 1;
+    pkt[o++] = 8; memcpy(pkt + o, dcid, 8); o += 8;
+    pkt[o++] = 8; memcpy(pkt + o, scid, 8); o += 8;
+    if (ptype == 0) pkt[o++] = 0;
+    size_t pay_len = flen < 4 ? 4 : flen;
+    size_t rem_len = 2 + pay_len + 16;
+    pkt[o++] = (unsigned char)(0x40u | (rem_len >> 8));
+    pkt[o++] = (unsigned char)rem_len;
+    size_t pn_off = o;
+    pkt[o++] = (unsigned char)(pn >> 8);
+    pkt[o++] = (unsigned char)pn;
+    size_t hdr_len = o;
+    memcpy(pkt + hdr_len, frames, flen);
+    if (pay_len > flen) memset(pkt + hdr_len + flen, 0, pay_len - flen);
+
+    unsigned char nonce[12];
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+    struct sc_aead aead;
+    if (sc_aead_setkey(&aead, SC_AES128_GCM, key) != 0) return -1;
+    int rc = sc_aead_seal(&aead, nonce, pkt, hdr_len, pkt + hdr_len, pay_len, pkt + hdr_len + pay_len);
+    sc_aead_free(&aead);
+    if (rc != 0) return -1;
+
+    unsigned char blk[16];
+    if (sc_aes_block(hp, 16, 0, pkt + pn_off + 4, blk) != 0) return -1;
+    pkt[0] ^= (unsigned char)(blk[0] & 0x0Fu);
+    pkt[pn_off]     ^= blk[1];
+    pkt[pn_off + 1] ^= blk[2];
+    return send(fd, pkt, hdr_len + pay_len + 16, MSG_NOSIGNAL) == (ssize_t)(hdr_len + pay_len + 16) ? 0 : -1;
+}
+
+static int hy2_seal_1rtt(int fd, const unsigned char dcid[8], const unsigned char secret[32],
+                         uint64_t pn, const unsigned char *frames, size_t flen) {
+    unsigned char key[16], iv[12], hp[16], pkt[1500];
+    if (xlabel(secret, "quic key", NULL, 0, key, 16) != 0 ||
+        xlabel(secret, "quic iv",  NULL, 0, iv,  12) != 0 ||
+        xlabel(secret, "quic hp",  NULL, 0, hp,  16) != 0)
+        return -1;
+    size_t o = 0;
+    pkt[o++] = 0x41u;
+    memcpy(pkt + o, dcid, 8); o += 8;
+    size_t pn_off = o;
+    pkt[o++] = (unsigned char)(pn >> 8);
+    pkt[o++] = (unsigned char)pn;
+    size_t hdr_len = o;
+    size_t pay_len = flen < 4 ? 4 : flen;
+    memcpy(pkt + hdr_len, frames, flen);
+    if (pay_len > flen) memset(pkt + hdr_len + flen, 0, pay_len - flen);
+
+    unsigned char nonce[12];
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+    struct sc_aead aead;
+    if (sc_aead_setkey(&aead, SC_AES128_GCM, key) != 0) return -1;
+    int rc = sc_aead_seal(&aead, nonce, pkt, hdr_len, pkt + hdr_len, pay_len, pkt + hdr_len + pay_len);
+    sc_aead_free(&aead);
+    if (rc != 0) return -1;
+
+    unsigned char blk[16];
+    if (sc_aes_block(hp, 16, 0, pkt + pn_off + 4, blk) != 0) return -1;
+    pkt[0] ^= (unsigned char)(blk[0] & 0x1Fu);
+    pkt[pn_off]     ^= blk[1];
+    pkt[pn_off + 1] ^= blk[2];
+    return send(fd, pkt, hdr_len + pay_len + 16, MSG_NOSIGNAL) == (ssize_t)(hdr_len + pay_len + 16) ? 0 : -1;
+}
+
+static void *hy2_mock_srv(void *arg) {
+    struct hy2_mock *m = arg;
+    struct pollfd pfd = { .fd = m->fd, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 2000) <= 0) return NULL;
+    unsigned char dgram[2048];
+    ssize_t r = recv(m->fd, dgram, sizeof(dgram), 0);
+    if (r < 64) return NULL;
+
+    unsigned char init_dcid[8], cli_scid[8];
+    memcpy(init_dcid, dgram + 6, 8);
+    memcpy(cli_scid, dgram + 15, 8);
+
+    static const unsigned char quic_v1_salt[20] = {
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+        0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+    };
+    unsigned char init_sec[32], c_in[32], s_in[32];
+    sc_hkdf_extract(SC_SHA256, quic_v1_salt, 20, init_dcid, 8, init_sec);
+    xlabel(init_sec, "client in", NULL, 0, c_in, 32);
+    xlabel(init_sec, "server in", NULL, 0, s_in, 32);
+
+    unsigned char c_key[16], c_iv[12], c_hp[16], blk[16];
+    xlabel(c_in, "quic key", NULL, 0, c_key, 16);
+    xlabel(c_in, "quic iv",  NULL, 0, c_iv,  12);
+    xlabel(c_in, "quic hp",  NULL, 0, c_hp,  16);
+
+    size_t rem_len = ((size_t)(dgram[24] & 0x3Fu) << 8) | dgram[25];
+    size_t pn_off = 26;
+    if (pn_off + rem_len > (size_t)r || rem_len < 20) return NULL;
+    sc_aes_block(c_hp, 16, 0, dgram + pn_off + 4, blk);
+    dgram[0] ^= (unsigned char)(blk[0] & 0x0Fu);
+    dgram[pn_off]     ^= blk[1];
+    dgram[pn_off + 1] ^= blk[2];
+    uint64_t pn = ((uint64_t)dgram[pn_off] << 8) | dgram[pn_off + 1];
+    size_t pay_len = rem_len - 2 - 16;
+
+    unsigned char nonce[12];
+    memcpy(nonce, c_iv, 12);
+    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+    struct sc_aead c_aead;
+    sc_aead_setkey(&c_aead, SC_AES128_GCM, c_key);
+    int orc = sc_aead_open(&c_aead, nonce, dgram, 28, dgram + 28, pay_len, dgram + 28 + pay_len);
+    sc_aead_free(&c_aead);
+    if (orc != 0) return NULL;
+
+    /* Extract CRYPTO frame at dgram + 28: [0x06][0x00][varint ch_len][ClientHello] */
+    const unsigned char *fp = dgram + 28;
+    if (fp[0] != 0x06 || fp[1] != 0x00) return NULL;
+    size_t vlen = 1u << (fp[2] >> 6);
+    size_t ch_len = fp[2] & 0x3Fu;
+    for (size_t i = 1; i < vlen; i++) ch_len = (ch_len << 8) | fp[2 + i];
+    const unsigned char *ch = fp + 2 + vlen;
+    unsigned char cpub[32], sid[32];
+    size_t sid_n = 0;
+    if (ch_pick(ch, ch_len, cpub, sid, &sid_n) != 0) return NULL;
+
+    unsigned char spriv[32], spub[32];
+    if (xc_x25519_keypair(spriv, spub) != 0) return NULL;
+
+    /* Build ServerHello (suite 0x1301) */
+    unsigned char sh[160];
+    size_t mlen = 0;
+    sh[mlen++] = 0x02; mlen += 3;
+    sh[mlen++] = 0x03; sh[mlen++] = 0x03;
+    memset(sh + mlen, 0x22, 32); mlen += 32;
+    sh[mlen++] = (unsigned char)sid_n;
+    memcpy(sh + mlen, sid, sid_n); mlen += sid_n;
+    sh[mlen++] = 0x13; sh[mlen++] = 0x01;
+    sh[mlen++] = 0x00;
+    size_t exts_at = mlen; mlen += 2;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x2b; sh[mlen++] = 0x00; sh[mlen++] = 0x02;
+    sh[mlen++] = 0x03; sh[mlen++] = 0x04;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x33; sh[mlen++] = 0x00; sh[mlen++] = 0x24;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x1d; sh[mlen++] = 0x00; sh[mlen++] = 0x20;
+    memcpy(sh + mlen, spub, 32); mlen += 32;
+    sh[exts_at]     = (unsigned char)((mlen - exts_at - 2) >> 8);
+    sh[exts_at + 1] = (unsigned char)(mlen - exts_at - 2);
+    sh[1] = 0; sh[2] = (unsigned char)((mlen - 4) >> 8); sh[3] = (unsigned char)(mlen - 4);
+
+    static const unsigned char srv_scid[8] = { 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98 };
+    unsigned char sh_cf[180];
+    size_t scfo = 0;
+    sh_cf[scfo++] = 0x06;
+    sh_cf[scfo++] = 0x00;
+    scfo += hy2_put_varint(sh_cf + scfo, mlen);
+    memcpy(sh_cf + scfo, sh, mlen); scfo += mlen;
+    if (hy2_seal_long(m->fd, 0, cli_scid, srv_scid, s_in, 0, sh_cf, scfo) != 0) return NULL;
+
+    struct sc_hash_ctx tr;
+    sc_hash_init(&tr, SC_SHA256);
+    sc_hash_update(&tr, ch, ch_len);
+    sc_hash_update(&tr, sh, mlen);
+
+    unsigned char zeros[32] = {0}, empty[32], early[32], derived[32], hs_sec[32], ecdhe[32], sh_th[32];
+    unsigned char c_hs[32], s_hs[32];
+    sc_hash(SC_SHA256, NULL, 0, empty);
+    sc_hkdf_extract(SC_SHA256, zeros, 32, zeros, 32, early);
+    xlabel(early, "derived", empty, 32, derived, 32);
+    x25519_shared_ext(spriv, cpub, ecdhe);
+    sc_hkdf_extract(SC_SHA256, derived, 32, ecdhe, 32, hs_sec);
+    tr_snapshot(&tr, sh_th);
+    xlabel(hs_sec, "c hs traffic", sh_th, 32, c_hs, 32);
+    xlabel(hs_sec, "s hs traffic", sh_th, 32, s_hs, 32);
+
+    /* Build Handshake flight in hs_buf */
+    unsigned char hs_buf[3072];
+    size_t hlen = 0;
+    /* EncryptedExtensions: ALPN "h3" (0x0010) + empty quic_transport_parameters (0x0039) */
+    static const unsigned char ee[19] = {
+        0x08, 0x00, 0x00, 15,
+        0x00, 13,
+        0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3',
+        0x00, 0x39, 0x00, 0x00
+    };
+    memcpy(hs_buf + hlen, ee, sizeof(ee)); hlen += sizeof(ee);
+    sc_hash_update(&tr, ee, sizeof(ee));
+
+    if (m->mode != HY2_MOCK_NO_CERT) {
+        const struct leaf *l = &g_leaf[LEAF_OK];
+        size_t cmn = cert_msg(l, 0, 0, hs_buf + hlen, sizeof(hs_buf) - hlen);
+        sc_hash_update(&tr, hs_buf + hlen, cmn);
+        hlen += cmn;
+        if (m->mode != HY2_MOCK_NO_CV) {
+            unsigned char cert_th[32];
+            tr_snapshot(&tr, cert_th);
+            struct plan dummy_pl = {0};
+            size_t cvn = cv_msg(l, cert_th, &dummy_pl, hs_buf + hlen, sizeof(hs_buf) - hlen);
+            sc_hash_update(&tr, hs_buf + hlen, cvn);
+            hlen += cvn;
+        }
+    }
+
+    unsigned char fin_th[32], fk[32], vd[32];
+    tr_snapshot(&tr, fin_th);
+    xlabel(s_hs, "finished", NULL, 0, fk, 32);
+    sc_hmac(SC_SHA256, fk, 32, fin_th, 32, vd);
+    hs_buf[hlen++] = 20; hs_buf[hlen++] = 0; hs_buf[hlen++] = 0; hs_buf[hlen++] = 32;
+    memcpy(hs_buf + hlen, vd, 32);
+    sc_hash_update(&tr, hs_buf + hlen - 4, 36);
+    hlen += 32;
+
+    unsigned char sf_th[32], d_sec[32], master[32], s_ap[32];
+    tr_snapshot(&tr, sf_th);
+    sc_hash_free(&tr);
+    xlabel(hs_sec, "derived", empty, 32, d_sec, 32);
+    sc_hkdf_extract(SC_SHA256, d_sec, 32, zeros, 32, master);
+    xlabel(master, "s ap traffic", sf_th, 32, s_ap, 32);
+
+    if (m->mode == HY2_MOCK_STATUS_200_FAKE_233 || m->mode == HY2_MOCK_OOO_SPLIT_233_OK) {
+        /* Send Handshake CRYPTO frames out-of-order: second half [half..hlen) first, then [0..half) */
+        size_t half = hlen / 2;
+        unsigned char f_hi[2048], f_lo[2048];
+        size_t o_hi = 0, o_lo = 0;
+        f_hi[o_hi++] = 0x06;
+        o_hi += hy2_put_varint(f_hi + o_hi, half);
+        o_hi += hy2_put_varint(f_hi + o_hi, hlen - half);
+        memcpy(f_hi + o_hi, hs_buf + half, hlen - half);
+        o_hi += hlen - half;
+        hy2_seal_long(m->fd, 2, cli_scid, srv_scid, s_hs, 0, f_hi, o_hi);
+
+        f_lo[o_lo++] = 0x06;
+        o_lo += hy2_put_varint(f_lo + o_lo, 0);
+        o_lo += hy2_put_varint(f_lo + o_lo, half);
+        memcpy(f_lo + o_lo, hs_buf, half);
+        o_lo += half;
+        hy2_seal_long(m->fd, 2, cli_scid, srv_scid, s_hs, 1, f_lo, o_lo);
+    } else {
+        unsigned char f_all[2048];
+        size_t o_all = 0;
+        f_all[o_all++] = 0x06;
+        o_all += hy2_put_varint(f_all + o_all, 0);
+        o_all += hy2_put_varint(f_all + o_all, hlen);
+        memcpy(f_all + o_all, hs_buf, hlen);
+        o_all += hlen;
+        hy2_seal_long(m->fd, 2, cli_scid, srv_scid, s_hs, 0, f_all, o_all);
+    }
+
+    /* Wait for client Finished + 1-RTT POST /auth (skip Initial/Handshake ACK & Finished packets) */
+    for (int i = 0; i < 16; i++) {
+        if (poll(&pfd, 1, 200) <= 0) break;
+        ssize_t nr = recv(m->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        if ((dgram[0] & 0x80) == 0) {
+            m->got_1rtt = 1;
+            break;
+        }
+    }
+    if (!m->got_1rtt) return NULL;
+
+    if (m->mode == HY2_MOCK_STATUS_200_FAKE_233) {
+        /* Stream 0 HTTP/3 HEADERS with :status = 200 (0xD9) AND x-pad: 233 (contains 0x03 '2' '3' '3') */
+        static const unsigned char h3_bad[] = {
+            0x01, 0x0D,             /* HEADERS frame, len = 13 */
+            0x00, 0x00,             /* QPACK prefix: RIC=0, DeltaBase=0 */
+            0xD9,                   /* Indexed static 25 -> :status = 200 */
+            0x25, 'x', '-', 'p', 'a', 'd',
+            0x03, '2', '3', '3'     /* Literal value "233" for header x-pad */
+        };
+        unsigned char sf[64];
+        size_t sfo = 0;
+        sf[sfo++] = 0x0B; /* STREAM(sid=0, off=0, len, fin=1) */
+        sf[sfo++] = 0x00;
+        sf[sfo++] = (unsigned char)sizeof(h3_bad);
+        memcpy(sf + sfo, h3_bad, sizeof(h3_bad));
+        sfo += sizeof(h3_bad);
+        hy2_seal_1rtt(m->fd, cli_scid, s_ap, 0, sf, sfo);
+    } else if (m->mode == HY2_MOCK_OOO_SPLIT_233_OK) {
+        /* Valid HTTP/3 HEADERS with :status = 233 split across two out-of-order STREAM frames */
+        static const unsigned char h3_ok[10] = {
+            0x01, 0x08,             /* HEADERS frame, len = 8 */
+            0x00, 0x00,             /* QPACK prefix: RIC=0, DeltaBase=0 */
+            0x5F, 0x09,             /* Literal with static name index 24 (:status) */
+            0x03, '2', '3', '3'     /* Value "233" */
+        };
+        unsigned char sf_hi[32], sf_lo[32];
+        size_t o1 = 0, o2 = 0;
+        /* Frame 1: offset = 4, len = 6, fin = 1 */
+        sf_hi[o1++] = 0x0F; /* STREAM(OFF=1, LEN=1, FIN=1) */
+        sf_hi[o1++] = 0x00; /* sid = 0 */
+        sf_hi[o1++] = 0x04; /* off = 4 */
+        sf_hi[o1++] = 0x06; /* len = 6 */
+        memcpy(sf_hi + o1, h3_ok + 4, 6);
+        o1 += 6;
+        hy2_seal_1rtt(m->fd, cli_scid, s_ap, 0, sf_hi, o1);
+
+        /* Frame 2: offset = 0, len = 4, fin = 0 */
+        sf_lo[o2++] = 0x0A; /* STREAM(OFF=0, LEN=1, FIN=0) */
+        sf_lo[o2++] = 0x00; /* sid = 0 */
+        sf_lo[o2++] = 0x04; /* len = 4 */
+        memcpy(sf_lo + o2, h3_ok, 4);
+        o2 += 4;
+        hy2_seal_1rtt(m->fd, cli_scid, s_ap, 1, sf_lo, o2);
+    }
+    return NULL;
+}
+
+static int run_hy2_mock(enum hy2_mock_mode mode, int *got_1rtt) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) return -100;
+    struct hy2_mock m = { .fd = sv[1], .mode = mode, .got_1rtt = 0 };
+    pthread_t th;
+    if (pthread_create(&th, NULL, hy2_mock_srv, &m) != 0) {
+        close(sv[0]); close(sv[1]);
+        return -101;
+    }
+    struct vless_node hyn;
+    memset(&hyn, 0, sizeof(hyn));
+    snprintf(hyn.proto, sizeof(hyn.proto), "%s", "hy2");
+    snprintf(hyn.host, sizeof(hyn.host), "%s", "node.invalid");
+    hyn.port = 8443;
+    snprintf(hyn.uuid, sizeof(hyn.uuid), "%s", "hy2-secret");
+    snprintf(hyn.type, sizeof(hyn.type), "%s", "quic");
+    snprintf(hyn.security, sizeof(hyn.security), "%s", "tls");
+    snprintf(hyn.sni, sizeof(hyn.sni), "%s", TLS_SNI);
+
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(&hyn, &c, 2);
+    g_tcp_dial = NULL;
+    if (rc == 0) transport_close(&c);
+    pthread_join(th, NULL);
+    close(sv[1]);
+    if (got_1rtt) *got_1rtt = m.got_1rtt;
+    return rc;
+}
+static int hy2_get_varint(const unsigned char *p, size_t len, uint64_t *val, size_t *consumed) {
+    if (len == 0) return -1;
+    unsigned int pfx = p[0] >> 6;
+    size_t vlen = 1u << pfx;
+    if (len < vlen) return -1;
+    uint64_t v = p[0] & 0x3Fu;
+    for (size_t i = 1; i < vlen; i++) v = (v << 8) | p[i];
+    *val = v;
+    *consumed = vlen;
+    return 0;
+}
+
+static int hy2_open_1rtt(unsigned char *dgram, size_t dlen, const unsigned char secret[32],
+                         uint64_t *out_pn, const unsigned char **out_frames, size_t *out_flen) {
+    if (dlen < 1 + 8 + 2 + 16 || (dgram[0] & 0x80) != 0) return -1;
+    unsigned char key[16], iv[12], hp[16], blk[16];
+    if (xlabel(secret, "quic key", NULL, 0, key, 16) != 0 ||
+        xlabel(secret, "quic iv",  NULL, 0, iv,  12) != 0 ||
+        xlabel(secret, "quic hp",  NULL, 0, hp,  16) != 0)
+        return -1;
+    size_t pn_off = 9;
+    if (pn_off + 20 > dlen) return -1;
+    if (sc_aes_block(hp, 16, 0, dgram + pn_off + 4, blk) != 0) return -1;
+    dgram[0] ^= (unsigned char)(blk[0] & 0x1Fu);
+    size_t pn_len = (dgram[0] & 0x03u) + 1;
+    for (size_t i = 0; i < pn_len; i++) dgram[pn_off + i] ^= blk[1 + i];
+    uint64_t pn = 0;
+    for (size_t i = 0; i < pn_len; i++) pn = (pn << 8) | dgram[pn_off + i];
+    size_t hdr_len = pn_off + pn_len;
+    if (dlen < hdr_len + 16) return -1;
+    size_t pay_len = dlen - hdr_len - 16;
+
+    unsigned char nonce[12];
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+    struct sc_aead aead;
+    if (sc_aead_setkey(&aead, SC_AES128_GCM, key) != 0) return -1;
+    int rc = sc_aead_open(&aead, nonce, dgram, hdr_len, dgram + hdr_len, pay_len, dgram + hdr_len + pay_len);
+    sc_aead_free(&aead);
+    if (rc != 0) return -1;
+    *out_pn = pn;
+    *out_frames = dgram + hdr_len;
+    *out_flen = pay_len;
+    return 0;
+}
+
+static int hy2_open_long(unsigned char *dgram, size_t dlen, const unsigned char secret[32],
+                         uint64_t *out_pn, const unsigned char **out_frames, size_t *out_flen) {
+    if (dlen < 30 || (dgram[0] & 0x80) == 0) return -1;
+    unsigned char key[16], iv[12], hp[16], blk[16];
+    if (xlabel(secret, "quic key", NULL, 0, key, 16) != 0 ||
+        xlabel(secret, "quic iv",  NULL, 0, iv,  12) != 0 ||
+        xlabel(secret, "quic hp",  NULL, 0, hp,  16) != 0)
+        return -1;
+    int ptype = (dgram[0] >> 4) & 0x03;
+    size_t pos = 5;
+    size_t dcid_len = dgram[pos++];
+    pos += dcid_len;
+    size_t scid_len = dgram[pos++];
+    pos += scid_len;
+    if (ptype == 0) {
+        uint64_t tok_len = 0; size_t c = 0;
+        if (hy2_get_varint(dgram + pos, dlen - pos, &tok_len, &c) != 0) return -1;
+        pos += c + (size_t)tok_len;
+    }
+    uint64_t rem_len = 0; size_t c = 0;
+    if (hy2_get_varint(dgram + pos, dlen - pos, &rem_len, &c) != 0) return -1;
+    size_t pn_off = pos + c;
+    if (pn_off + rem_len > dlen || rem_len < 20) return -1;
+    if (sc_aes_block(hp, 16, 0, dgram + pn_off + 4, blk) != 0) return -1;
+    dgram[0] ^= (unsigned char)(blk[0] & 0x0Fu);
+    size_t pn_len = (dgram[0] & 0x03u) + 1;
+    for (size_t i = 0; i < pn_len; i++) dgram[pn_off + i] ^= blk[1 + i];
+    uint64_t pn = 0;
+    for (size_t i = 0; i < pn_len; i++) pn = (pn << 8) | dgram[pn_off + i];
+    size_t hdr_len = pn_off + pn_len;
+    size_t pay_len = (size_t)rem_len - pn_len - 16;
+
+    unsigned char nonce[12];
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+    struct sc_aead aead;
+    if (sc_aead_setkey(&aead, SC_AES128_GCM, key) != 0) return -1;
+    int rc = sc_aead_open(&aead, nonce, dgram, hdr_len, dgram + hdr_len, pay_len, dgram + hdr_len + pay_len);
+    sc_aead_free(&aead);
+    if (rc != 0) return -1;
+    *out_pn = pn;
+    *out_frames = dgram + hdr_len;
+    *out_flen = pay_len;
+    return 0;
+}
+
+static int hy2_handshake_srv(int fd, uint64_t init_max_data, uint64_t init_max_s4_data,
+                             unsigned char cli_scid[8], unsigned char c_ap[32], unsigned char s_ap[32],
+                             uint64_t *srv_1rtt_pn) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 2000) <= 0) return -1;
+    unsigned char dgram[2048];
+    ssize_t r = recv(fd, dgram, sizeof(dgram), 0);
+    if (r < 64) return -1;
+
+    unsigned char init_dcid[8];
+    memcpy(init_dcid, dgram + 6, 8);
+    memcpy(cli_scid, dgram + 15, 8);
+
+    static const unsigned char quic_v1_salt[20] = {
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+        0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+    };
+    unsigned char init_sec[32], c_in[32], s_in[32];
+    sc_hkdf_extract(SC_SHA256, quic_v1_salt, 20, init_dcid, 8, init_sec);
+    xlabel(init_sec, "client in", NULL, 0, c_in, 32);
+    xlabel(init_sec, "server in", NULL, 0, s_in, 32);
+
+    uint64_t pn = 0;
+    const unsigned char *fp = NULL;
+    size_t pay_len = 0;
+    if (hy2_open_long(dgram, (size_t)r, c_in, &pn, &fp, &pay_len) != 0) return -1;
+    if (pay_len < 4 || fp[0] != 0x06 || fp[1] != 0x00) return -1;
+    uint64_t ch_len = 0; size_t c = 0;
+    if (hy2_get_varint(fp + 2, pay_len - 2, &ch_len, &c) != 0) return -1;
+    const unsigned char *ch = fp + 2 + c;
+    unsigned char cpub[32], sid[32];
+    size_t sid_n = 0;
+    if (ch_pick(ch, (size_t)ch_len, cpub, sid, &sid_n) != 0) return -1;
+
+    unsigned char spriv[32], spub[32];
+    if (xc_x25519_keypair(spriv, spub) != 0) return -1;
+
+    unsigned char sh[160];
+    size_t mlen = 0;
+    sh[mlen++] = 0x02; mlen += 3;
+    sh[mlen++] = 0x03; sh[mlen++] = 0x03;
+    memset(sh + mlen, 0x22, 32); mlen += 32;
+    sh[mlen++] = (unsigned char)sid_n;
+    memcpy(sh + mlen, sid, sid_n); mlen += sid_n;
+    sh[mlen++] = 0x13; sh[mlen++] = 0x01;
+    sh[mlen++] = 0x00;
+    size_t exts_at = mlen; mlen += 2;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x2b; sh[mlen++] = 0x00; sh[mlen++] = 0x02;
+    sh[mlen++] = 0x03; sh[mlen++] = 0x04;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x33; sh[mlen++] = 0x00; sh[mlen++] = 0x24;
+    sh[mlen++] = 0x00; sh[mlen++] = 0x1d; sh[mlen++] = 0x00; sh[mlen++] = 0x20;
+    memcpy(sh + mlen, spub, 32); mlen += 32;
+    sh[exts_at]     = (unsigned char)((mlen - exts_at - 2) >> 8);
+    sh[exts_at + 1] = (unsigned char)(mlen - exts_at - 2);
+    sh[1] = 0; sh[2] = (unsigned char)((mlen - 4) >> 8); sh[3] = (unsigned char)(mlen - 4);
+
+    static const unsigned char srv_scid[8] = { 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98 };
+    unsigned char sh_cf[180];
+    size_t scfo = 0;
+    sh_cf[scfo++] = 0x06;
+    sh_cf[scfo++] = 0x00;
+    scfo += hy2_put_varint(sh_cf + scfo, mlen);
+    memcpy(sh_cf + scfo, sh, mlen); scfo += mlen;
+    if (hy2_seal_long(fd, 0, cli_scid, srv_scid, s_in, 0, sh_cf, scfo) != 0) return -1;
+
+    struct sc_hash_ctx tr;
+    sc_hash_init(&tr, SC_SHA256);
+    sc_hash_update(&tr, ch, (size_t)ch_len);
+    sc_hash_update(&tr, sh, mlen);
+
+    unsigned char zeros[32] = {0}, empty[32], early[32], derived[32], hs_sec[32], ecdhe[32], sh_th[32];
+    unsigned char c_hs[32], s_hs[32];
+    sc_hash(SC_SHA256, NULL, 0, empty);
+    sc_hkdf_extract(SC_SHA256, zeros, 32, zeros, 32, early);
+    xlabel(early, "derived", empty, 32, derived, 32);
+    x25519_shared_ext(spriv, cpub, ecdhe);
+    sc_hkdf_extract(SC_SHA256, derived, 32, ecdhe, 32, hs_sec);
+    tr_snapshot(&tr, sh_th);
+    xlabel(hs_sec, "c hs traffic", sh_th, 32, c_hs, 32);
+    xlabel(hs_sec, "s hs traffic", sh_th, 32, s_hs, 32);
+
+    unsigned char hs_buf[3072];
+    size_t hlen = 0;
+    /* EncryptedExtensions with optional quic_transport_parameters (0x0039) */
+    unsigned char tp[64];
+    size_t tpo = 0;
+    if (init_max_data > 0) {
+        tpo += hy2_put_varint(tp + tpo, 0x04);
+        unsigned char vb[8];
+        size_t vn = hy2_put_varint(vb, init_max_data);
+        tpo += hy2_put_varint(tp + tpo, vn);
+        memcpy(tp + tpo, vb, vn); tpo += vn;
+    }
+    if (init_max_s4_data > 0) {
+        tpo += hy2_put_varint(tp + tpo, 0x06);
+        unsigned char vb[8];
+        size_t vn = hy2_put_varint(vb, init_max_s4_data);
+        tpo += hy2_put_varint(tp + tpo, vn);
+        memcpy(tp + tpo, vb, vn); tpo += vn;
+    }
+    static const unsigned char alpn_h3[9] = {
+        0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3'
+    };
+    unsigned char ee[80];
+    size_t eeo = 0;
+    size_t ext_tot = sizeof(alpn_h3) + 4 + tpo;
+    size_t msg_len = 2 + ext_tot;
+    ee[eeo++] = 0x08;
+    ee[eeo++] = 0x00; ee[eeo++] = (unsigned char)(msg_len >> 8); ee[eeo++] = (unsigned char)msg_len;
+    ee[eeo++] = (unsigned char)(ext_tot >> 8); ee[eeo++] = (unsigned char)ext_tot;
+    memcpy(ee + eeo, alpn_h3, sizeof(alpn_h3)); eeo += sizeof(alpn_h3);
+    ee[eeo++] = 0x00; ee[eeo++] = 0x39;
+    ee[eeo++] = (unsigned char)(tpo >> 8); ee[eeo++] = (unsigned char)tpo;
+    if (tpo > 0) { memcpy(ee + eeo, tp, tpo); eeo += tpo; }
+    memcpy(hs_buf + hlen, ee, eeo); hlen += eeo;
+    sc_hash_update(&tr, ee, eeo);
+
+    const struct leaf *l = &g_leaf[LEAF_OK];
+    size_t cmn = cert_msg(l, 0, 0, hs_buf + hlen, sizeof(hs_buf) - hlen);
+    sc_hash_update(&tr, hs_buf + hlen, cmn);
+    hlen += cmn;
+    unsigned char cert_th[32];
+    tr_snapshot(&tr, cert_th);
+    struct plan dummy_pl = {0};
+    size_t cvn = cv_msg(l, cert_th, &dummy_pl, hs_buf + hlen, sizeof(hs_buf) - hlen);
+    sc_hash_update(&tr, hs_buf + hlen, cvn);
+    hlen += cvn;
+
+    unsigned char fin_th[32], fk[32], vd[32];
+    tr_snapshot(&tr, fin_th);
+    xlabel(s_hs, "finished", NULL, 0, fk, 32);
+    sc_hmac(SC_SHA256, fk, 32, fin_th, 32, vd);
+    hs_buf[hlen++] = 20; hs_buf[hlen++] = 0; hs_buf[hlen++] = 0; hs_buf[hlen++] = 32;
+    memcpy(hs_buf + hlen, vd, 32);
+    sc_hash_update(&tr, hs_buf + hlen - 4, 36);
+    hlen += 32;
+
+    unsigned char sf_th[32], d_sec[32], master[32];
+    tr_snapshot(&tr, sf_th);
+    sc_hash_free(&tr);
+    xlabel(hs_sec, "derived", empty, 32, d_sec, 32);
+    sc_hkdf_extract(SC_SHA256, d_sec, 32, zeros, 32, master);
+    xlabel(master, "c ap traffic", sf_th, 32, c_ap, 32);
+    xlabel(master, "s ap traffic", sf_th, 32, s_ap, 32);
+
+    unsigned char f_all[2048];
+    size_t o_all = 0;
+    f_all[o_all++] = 0x06;
+    o_all += hy2_put_varint(f_all + o_all, 0);
+    o_all += hy2_put_varint(f_all + o_all, hlen);
+    memcpy(f_all + o_all, hs_buf, hlen);
+    o_all += hlen;
+    if (hy2_seal_long(fd, 2, cli_scid, srv_scid, s_hs, 0, f_all, o_all) != 0) return -1;
+
+    /* Receive client Handshake Finished + 1-RTT /auth */
+    int got_auth = 0;
+    for (int i = 0; i < 6; i++) {
+        if (poll(&pfd, 1, 300) <= 0) break;
+        ssize_t nr = recv(fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        if ((dgram[0] & 0x80) == 0) {
+            uint64_t ap_pn = 0;
+            const unsigned char *afp = NULL;
+            size_t aflen = 0;
+            if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &ap_pn, &afp, &aflen) == 0) {
+                /* ACK client's 1-RTT auth packet */
+                unsigned char ackf[16];
+                size_t ao = 0;
+                ackf[ao++] = 0x02;
+                ao += hy2_put_varint(ackf + ao, ap_pn);
+                ackf[ao++] = 0x00;
+                ackf[ao++] = 0x00;
+                ackf[ao++] = 0x00;
+                hy2_seal_1rtt(fd, cli_scid, s_ap, (*srv_1rtt_pn)++, ackf, ao);
+                got_auth = 1;
+                break;
+            }
+        }
+    }
+    if (!got_auth) return -1;
+
+    /* Send Stream 0 HTTP/3 :status = 233 + Stream 4 TCP response status OK (0x00, msg_len=0, pad_len=0) */
+    static const unsigned char h3_ok[10] = {
+        0x01, 0x08, 0x00, 0x00, 0x5F, 0x09, 0x03, '2', '3', '3'
+    };
+    unsigned char sf[32];
+    size_t sfo = 0;
+    sf[sfo++] = 0x0B; /* STREAM(sid=0, off=0, len, fin=1) */
+    sf[sfo++] = 0x00;
+    sf[sfo++] = (unsigned char)sizeof(h3_ok);
+    memcpy(sf + sfo, h3_ok, sizeof(h3_ok));
+    sfo += sizeof(h3_ok);
+    if (hy2_seal_1rtt(fd, cli_scid, s_ap, (*srv_1rtt_pn)++, sf, sfo) != 0) return -1;
+    return 0;
+}
+
+/* Parse STREAM frames for sid=4 inside a decrypted 1-RTT payload, and inspect ACK/control frames */
+struct hy2_rx_inspect {
+    int saw_ack;
+    uint64_t max_ack_range_cnt;
+    int saw_stream_data_blocked;
+    int saw_data_blocked;
+    uint64_t max_stream_data_val;
+    uint64_t max_data_val;
+    int pkt_has_msd;
+    int pkt_has_md;
+    uint64_t pkt_msd_val;
+    uint64_t pkt_md_val;
+    int saw_ping;
+    int saw_dgram;
+    unsigned char dgram_buf[2048];
+    size_t dgram_len;
+};
+
+static int hy2_parse_1rtt_frames(const unsigned char *fp, size_t flen,
+                                 unsigned char *s4_buf, size_t s4_cap, size_t *s4_max_end,
+                                 uint8_t *s4_bitmap, struct hy2_rx_inspect *ins) {
+    size_t pos = 0;
+    int s4_chunks = 0;
+    if (ins) {
+        ins->pkt_has_msd = 0;
+        ins->pkt_has_md  = 0;
+        ins->pkt_msd_val = 0;
+        ins->pkt_md_val  = 0;
+    }
+    while (pos < flen) {
+        uint64_t ftype = 0; size_t c = 0;
+        if (hy2_get_varint(fp + pos, flen - pos, &ftype, &c) != 0) return -1;
+        pos += c;
+        if (ftype == 0x00) continue;
+        if (ftype == 0x01) { if (ins) ins->saw_ping = 1; continue; }
+        if (ftype == 0x02 || ftype == 0x03) {
+            uint64_t largest = 0, delay = 0, rcnt = 0, first_r = 0;
+            size_t c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &largest, &c1) != 0) return -1;
+            pos += c1;
+            if (hy2_get_varint(fp + pos, flen - pos, &delay, &c2) != 0) return -1;
+            pos += c2;
+            if (hy2_get_varint(fp + pos, flen - pos, &rcnt, &c3) != 0) return -1;
+            pos += c3;
+            if (hy2_get_varint(fp + pos, flen - pos, &first_r, &c4) != 0) return -1;
+            pos += c4;
+            if (ins) {
+                ins->saw_ack = 1;
+                if (rcnt > ins->max_ack_range_cnt) ins->max_ack_range_cnt = rcnt;
+            }
+            for (uint64_t i = 0; i < rcnt; i++) {
+                uint64_t gap = 0, rlen = 0; size_t cg = 0, cr = 0;
+                if (hy2_get_varint(fp + pos, flen - pos, &gap, &cg) != 0) return -1;
+                pos += cg;
+                if (hy2_get_varint(fp + pos, flen - pos, &rlen, &cr) != 0) return -1;
+                pos += cr;
+            }
+            if (ftype == 0x03) {
+                for (int i = 0; i < 3; i++) {
+                    uint64_t v = 0; size_t cv = 0;
+                    if (hy2_get_varint(fp + pos, flen - pos, &v, &cv) != 0) return -1;
+                    pos += cv;
+                }
+            }
+            continue;
+        }
+        if (ftype >= 0x08 && ftype <= 0x0f) {
+            int has_off = (ftype & 0x04) != 0;
+            int has_len = (ftype & 0x02) != 0;
+            uint64_t sid = 0, off = 0, slen = 0; size_t cs = 0, co = 0, cl = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &sid, &cs) != 0) return -1;
+            pos += cs;
+            if (has_off) {
+                if (hy2_get_varint(fp + pos, flen - pos, &off, &co) != 0) return -1;
+                pos += co;
+            }
+            if (has_len) {
+                if (hy2_get_varint(fp + pos, flen - pos, &slen, &cl) != 0) return -1;
+                pos += cl;
+            } else {
+                slen = flen - pos;
+            }
+            if (pos + slen > flen) return -1;
+            if (sid == 4 && s4_buf) {
+                if (off + slen <= s4_cap) {
+                    memcpy(s4_buf + off, fp + pos, (size_t)slen);
+                    if (s4_bitmap) {
+                        for (size_t k = 0; k < (size_t)slen; k++) s4_bitmap[off + k] = 1;
+                    }
+                    if (off + slen > *s4_max_end) *s4_max_end = (size_t)(off + slen);
+                    s4_chunks++;
+                }
+            }
+            pos += (size_t)slen;
+            continue;
+        }
+        if (ftype == 0x10) {
+            uint64_t md = 0; size_t cm = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &md, &cm) != 0) return -1;
+            pos += cm;
+            if (ins) {
+                ins->pkt_has_md = 1;
+                ins->pkt_md_val = md;
+                if (md > ins->max_data_val) ins->max_data_val = md;
+            }
+            continue;
+        }
+        if (ftype == 0x11) {
+            uint64_t sid = 0, msd = 0; size_t cs = 0, cm = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &sid, &cs) != 0) return -1;
+            pos += cs;
+            if (hy2_get_varint(fp + pos, flen - pos, &msd, &cm) != 0) return -1;
+            pos += cm;
+            if (ins && sid == 4) {
+                ins->pkt_has_msd = 1;
+                ins->pkt_msd_val = msd;
+                if (msd > ins->max_stream_data_val) ins->max_stream_data_val = msd;
+            }
+            continue;
+        }
+        if (ftype == 0x14) {
+            uint64_t lim = 0; size_t cl = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &lim, &cl) != 0) return -1;
+            pos += cl;
+            if (ins) ins->saw_data_blocked = 1;
+            continue;
+        }
+        if (ftype == 0x15) {
+            uint64_t sid = 0, lim = 0; size_t cs = 0, cl = 0;
+            if (hy2_get_varint(fp + pos, flen - pos, &sid, &cs) != 0) return -1;
+            pos += cs;
+            if (hy2_get_varint(fp + pos, flen - pos, &lim, &cl) != 0) return -1;
+            pos += cl;
+            if (ins && sid == 4) ins->saw_stream_data_blocked = 1;
+            continue;
+        }
+        if (ftype == 0x30 || ftype == 0x31) {
+            uint64_t dlen = 0; size_t cd = 0;
+            if (ftype == 0x31) {
+                if (hy2_get_varint(fp + pos, flen - pos, &dlen, &cd) != 0) return -1;
+                pos += cd;
+            } else {
+                dlen = flen - pos;
+            }
+            if (pos + dlen > flen) return -1;
+            if (ins && dlen <= sizeof(ins->dgram_buf)) {
+                ins->saw_dgram++;
+                memcpy(ins->dgram_buf, fp + pos, (size_t)dlen);
+                ins->dgram_len = (size_t)dlen;
+            }
+            pos += (size_t)dlen;
+            continue;
+        }
+        break;
+    }
+    return s4_chunks;
+}
+
+/* Scenario 1: Loss Recovery (Packet Threshold + PTO Tail Loss), Multi-Range SACK, Duplicate Suppression */
+struct hy2_loss_srv_ctx {
+    int fd;
+    int ok;
+    int saw_multi_sack;
+    int saw_monotonic_retx_pn;
+    int dropped_pkt_threshold;
+    int dropped_tail_pto;
+    size_t rx_total;
+    unsigned char rx_stream[65536];
+    uint8_t rx_bitmap[65536];
+};
+
+static size_t hy2_build_srv_ack(const uint8_t *rx_pn, uint64_t max_pn, unsigned char *out) {
+    struct { uint64_t low, high; } rng[32];
+    size_t nr = 0;
+    int64_t p = (int64_t)max_pn;
+    while (p >= 0 && nr < 32) {
+        while (p >= 0 && !rx_pn[p]) p--;
+        if (p < 0) break;
+        uint64_t hi = (uint64_t)p;
+        while (p >= 0 && rx_pn[p]) p--;
+        uint64_t lo = (uint64_t)(p + 1);
+        rng[nr].low = lo;
+        rng[nr].high = hi;
+        nr++;
+    }
+    if (nr == 0) return 0;
+    size_t o = 0;
+    out[o++] = 0x02;
+    o += hy2_put_varint(out + o, rng[0].high);
+    out[o++] = 0x00; /* delay = 0 */
+    o += hy2_put_varint(out + o, nr - 1);
+    o += hy2_put_varint(out + o, rng[0].high - rng[0].low);
+    uint64_t prev_low = rng[0].low;
+    for (size_t i = 1; i < nr; i++) {
+        uint64_t gap = prev_low - rng[i].high - 2;
+        uint64_t rlen = rng[i].high - rng[i].low;
+        o += hy2_put_varint(out + o, gap);
+        o += hy2_put_varint(out + o, rlen);
+        prev_low = rng[i].low;
+    }
+    return o;
+}
+
+static void *hy2_loss_srv_thread(void *arg) {
+    struct hy2_loss_srv_ctx *ctx = arg;
+    unsigned char cli_scid[8], c_ap[32], s_ap[32];
+    uint64_t srv_pn = 0;
+    if (hy2_handshake_srv(ctx->fd, 0, 0, cli_scid, c_ap, s_ap, &srv_pn) != 0) return NULL;
+
+    struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN, .revents = 0 };
+    unsigned char dgram[2048];
+    struct hy2_rx_inspect ins;
+    memset(&ins, 0, sizeof(ins));
+    uint8_t srv_rx_pn[512];
+    memset(srv_rx_pn, 0, sizeof(srv_rx_pn));
+    srv_rx_pn[0] = 1; /* auth packet pn=0 */
+    uint64_t max_rx_pn = 0;
+
+    /* Step A: Wait for client's HY2 TCP framing header on Stream 4 ([0x40,0x01][addr][pad]) */
+    size_t s4_max_end = 0;
+    size_t hdr_len = 0;
+    uint64_t last_cli_pn = 0;
+    int have_last_pn = 0;
+    int monotonic_ok = 1;
+
+    while (s4_max_end < 14) {
+        if (poll(&pfd, 1, 1000) <= 0) return NULL;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) return NULL;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        if (have_last_pn && pn <= last_cli_pn) monotonic_ok = 0;
+        last_cli_pn = pn; have_last_pn = 1;
+        if (pn < sizeof(srv_rx_pn)) srv_rx_pn[pn] = 1;
+        if (pn > max_rx_pn) max_rx_pn = pn;
+        hy2_parse_1rtt_frames(fp, flen, ctx->rx_stream, sizeof(ctx->rx_stream), &s4_max_end, ctx->rx_bitmap, &ins);
+        if (s4_max_end < 14) continue;
+        /* ACK the TCP request header and send HY2 TCP response [0x00 (OK), 0x00 (msg_len=0), 0x00 (pad_len=0)] */
+        unsigned char resp[64];
+        size_t ro = hy2_build_srv_ack(srv_rx_pn, max_rx_pn, resp);
+        resp[ro++] = 0x0A; /* STREAM(sid=4, off=0, len=3) */
+        resp[ro++] = 0x04;
+        resp[ro++] = 0x03;
+        resp[ro++] = 0x00; resp[ro++] = 0x00; resp[ro++] = 0x00;
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, resp, ro);
+        hdr_len = s4_max_end;
+        break;
+    }
+
+    /* Step B: Send 8 server Stream 4 chunks (8 * 1000 = 8000 bytes) OUT OF ORDER and with DUPLICATE PN
+     * AND with a deliberate PN gap so client emits a multi-range SACK (rcnt >= 1):
+     * First wave: chunk 2 (pn = base_pn), chunk 4 (pn = base_pn + 2, skipping base_pn + 1!), duplicate chunk 2 (pn = base_pn). */
+    size_t srv_off_base = 3; /* after 3-byte HY2 TCP status header */
+    uint64_t base_pn = srv_pn;
+    srv_pn += 8;
+    int wave1_ch[3] = { 2, 4, 2 };
+    uint64_t wave1_pn[3] = { base_pn, base_pn + 2, base_pn };
+    for (int idx = 0; idx < 3; idx++) {
+        int ch_i = wave1_ch[idx];
+        size_t off = srv_off_base + (size_t)ch_i * 1000;
+        unsigned char sf[1100];
+        size_t so = 0;
+        sf[so++] = 0x0E;
+        sf[so++] = 0x04;
+        so += hy2_put_varint(sf + so, off);
+        so += hy2_put_varint(sf + so, 1000);
+        for (size_t k = 0; k < 1000; k++) sf[so + k] = (unsigned char)((ch_i * 37 + k) & 0xFF);
+        so += 1000;
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, wave1_pn[idx], sf, so);
+    }
+
+    /* Wait briefly for client to process wave 1 and emit its multi-range SACK (rcnt >= 1) */
+    for (int w = 0; w < 6 && ins.max_ack_range_cnt < 1; w++) {
+        if (poll(&pfd, 1, 30) <= 0) continue;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) == 0) {
+            if (pn <= last_cli_pn) monotonic_ok = 0;
+            last_cli_pn = pn;
+            if (pn < sizeof(srv_rx_pn)) srv_rx_pn[pn] = 1;
+            if (pn > max_rx_pn) max_rx_pn = pn;
+            hy2_parse_1rtt_frames(fp, flen, ctx->rx_stream, sizeof(ctx->rx_stream), &s4_max_end, ctx->rx_bitmap, &ins);
+        }
+    }
+
+    /* Second wave: fill the PN gap (base_pn + 1) and send remaining chunks 0, 1, 3, 5, 6, 7 */
+    int wave2_ch[6] = { 0, 1, 3, 5, 6, 7 };
+    uint64_t wave2_pn[6] = { base_pn + 1, base_pn + 3, base_pn + 4, base_pn + 5, base_pn + 6, base_pn + 7 };
+    for (int idx = 0; idx < 6; idx++) {
+        int ch_i = wave2_ch[idx];
+        size_t off = srv_off_base + (size_t)ch_i * 1000;
+        unsigned char sf[1100];
+        size_t so = 0;
+        sf[so++] = 0x0E;
+        sf[so++] = 0x04;
+        so += hy2_put_varint(sf + so, off);
+        so += hy2_put_varint(sf + so, 1000);
+        for (size_t k = 0; k < 1000; k++) sf[so + k] = (unsigned char)((ch_i * 37 + k) & 0xFF);
+        so += 1000;
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, wave2_pn[idx], sf, so);
+    }
+
+    /* Step C: Receive 16000 bytes of client payload (after hdr_len) on Stream 4.
+     * Deliberately DROP the 2nd data packet (to trigger 3-packet-threshold loss detection via SACK)
+     * AND deliberately DROP the last packet in the flight (to trigger PTO tail recovery!). */
+    size_t target_end = hdr_len + 16000;
+    int data_pkt_idx = 0;
+    int dropped_1 = 0, dropped_tail = 0;
+
+    for (int iter = 0; iter < 250; iter++) {
+        int all_done = 1;
+        for (size_t k = hdr_len; k < target_end; k++) {
+            if (!ctx->rx_bitmap[k]) { all_done = 0; break; }
+        }
+        if (all_done && ins.max_ack_range_cnt >= 1) break;
+
+        if (poll(&pfd, 1, 200) <= 0) continue;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        if (pn <= last_cli_pn) monotonic_ok = 0;
+        last_cli_pn = pn;
+
+        /* Peek if packet has Stream 4 data before committing */
+        unsigned char tmp_buf[65536];
+        uint8_t tmp_bm[65536];
+        size_t tmp_end = s4_max_end;
+        memcpy(tmp_bm, ctx->rx_bitmap, sizeof(tmp_bm));
+        int s4c = hy2_parse_1rtt_frames(fp, flen, tmp_buf, sizeof(tmp_buf), &tmp_end, tmp_bm, &ins);
+        if (s4c > 0) {
+            data_pkt_idx++;
+            if (!dropped_1 && data_pkt_idx == 2) {
+                /* Drop packet #2: do NOT record in srv_rx_pn and do NOT copy into rx_stream */
+                dropped_1 = 1;
+                ctx->dropped_pkt_threshold = 1;
+                continue;
+            }
+            if (!dropped_tail && tmp_end >= target_end) {
+                /* Drop the final packet of the flight: do NOT record in srv_rx_pn and do NOT ACK it, forcing PTO! */
+                dropped_tail = 1;
+                ctx->dropped_tail_pto = 1;
+                continue;
+            }
+        }
+        /* Accept packet */
+        if (pn < sizeof(srv_rx_pn)) srv_rx_pn[pn] = 1;
+        if (pn > max_rx_pn) max_rx_pn = pn;
+        hy2_parse_1rtt_frames(fp, flen, ctx->rx_stream, sizeof(ctx->rx_stream), &s4_max_end, ctx->rx_bitmap, &ins);
+
+        unsigned char ackf[128];
+        size_t ao = hy2_build_srv_ack(srv_rx_pn, max_rx_pn, ackf);
+        if (ao > 0)
+            hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, ackf, ao);
+    }
+
+    ctx->saw_multi_sack = (ins.max_ack_range_cnt >= 1) ? 1 : 0;
+    ctx->saw_monotonic_retx_pn = monotonic_ok;
+    ctx->rx_total = (s4_max_end >= hdr_len) ? (s4_max_end - hdr_len) : 0;
+    if (ctx->rx_total == 16000) {
+        memmove(ctx->rx_stream, ctx->rx_stream + hdr_len, 16000);
+        ctx->ok = 1;
+    }
+    return NULL;
+}
+
+/* Scenario 2: Send & Receive Flow Control (EncryptedExtensions TP, STREAM_DATA_BLOCKED, MAX_STREAM_DATA, MAX_DATA) */
+struct hy2_fc_srv_ctx {
+    int fd;
+    int saw_stream_data_blocked;
+    int capped_at_initial_window;
+    int resumed_after_max_stream_data;
+    int saw_client_max_stream_data;
+    int saw_client_max_data;
+    size_t rx_total;
+};
+
+static void *hy2_fc_srv_thread(void *arg) {
+    struct hy2_fc_srv_ctx *ctx = arg;
+    unsigned char cli_scid[8], c_ap[32], s_ap[32];
+    uint64_t srv_pn = 0;
+    /* Advertise initial_max_data = 4096, initial_max_stream_data_bidi_remote = 1500 */
+    if (hy2_handshake_srv(ctx->fd, 4096, 1500, cli_scid, c_ap, s_ap, &srv_pn) != 0) return NULL;
+
+    struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN, .revents = 0 };
+    unsigned char dgram[2048];
+    unsigned char rx_buf[16384];
+    uint8_t rx_bm[16384];
+    memset(rx_bm, 0, sizeof(rx_bm));
+    size_t s4_max_end = 0;
+    struct hy2_rx_inspect ins;
+    memset(&ins, 0, sizeof(ins));
+
+    /* Collect client's initial burst until it blocks at 1500 bytes and sends STREAM_DATA_BLOCKED (0x15) */
+    for (int i = 0; i < 15; i++) {
+        if (poll(&pfd, 1, 80) <= 0) break;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        hy2_parse_1rtt_frames(fp, flen, rx_buf, sizeof(rx_buf), &s4_max_end, rx_bm, &ins);
+        unsigned char ackf[32]; size_t ao = 0;
+        ackf[ao++] = 0x02; ao += hy2_put_varint(ackf + ao, pn);
+        ackf[ao++] = 0; ackf[ao++] = 0; ao += hy2_put_varint(ackf + ao, pn);
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, ackf, ao);
+        if (ins.saw_stream_data_blocked && s4_max_end == 1500) break;
+    }
+
+    if (s4_max_end == 1500) ctx->capped_at_initial_window = 1;
+    if (ins.saw_stream_data_blocked) ctx->saw_stream_data_blocked = 1;
+
+    /* Now grant MAX_STREAM_DATA(sid=4, 16384) and MAX_DATA(32768) + HY2 TCP OK response on Stream 4 */
+    unsigned char grant[64];
+    size_t go = 0;
+    grant[go++] = 0x11; /* MAX_STREAM_DATA */
+    grant[go++] = 0x04; /* sid = 4 */
+    go += hy2_put_varint(grant + go, 16384);
+    grant[go++] = 0x10; /* MAX_DATA */
+    go += hy2_put_varint(grant + go, 32768);
+    grant[go++] = 0x0A; /* STREAM(sid=4, off=0, len=3) */
+    grant[go++] = 0x04;
+    grant[go++] = 0x03;
+    grant[go++] = 0x00; grant[go++] = 0x00; grant[go++] = 0x00;
+    hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, grant, go);
+
+    /* Also send 20000 bytes of server Stream 4 data so client consumes > 16 KiB and emits MAX_STREAM_DATA */
+    size_t srv_off = 3;
+    for (int chunk = 0; chunk < 20; chunk++) {
+        unsigned char sf[1100];
+        size_t so = 0;
+        sf[so++] = 0x0E;
+        sf[so++] = 0x04;
+        so += hy2_put_varint(sf + so, srv_off);
+        so += hy2_put_varint(sf + so, 1000);
+        memset(sf + so, 0x5A, 1000);
+        so += 1000;
+        srv_off += 1000;
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, sf, so);
+    }
+
+    /* Receive remaining client Stream 4 data and client's MAX_STREAM_DATA update */
+    for (int i = 0; i < 40; i++) {
+        if (s4_max_end > 4000) ctx->resumed_after_max_stream_data = 1;
+        if (ins.max_stream_data_val > 0) ctx->saw_client_max_stream_data = 1;
+        if (ins.max_data_val > 0) ctx->saw_client_max_data = 1;
+        if (s4_max_end > 4000 && ins.max_stream_data_val > 0) break;
+        if (poll(&pfd, 1, 100) <= 0) continue;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        hy2_parse_1rtt_frames(fp, flen, rx_buf, sizeof(rx_buf), &s4_max_end, rx_bm, &ins);
+        unsigned char ackf[32]; size_t ao = 0;
+        ackf[ao++] = 0x02; ao += hy2_put_varint(ackf + ao, pn);
+        ackf[ao++] = 0; ackf[ao++] = 0; ao += hy2_put_varint(ackf + ao, pn);
+        hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, ackf, ao);
+    }
+
+    if (s4_max_end > 4000) ctx->resumed_after_max_stream_data = 1;
+    if (ins.max_stream_data_val > 0) ctx->saw_client_max_stream_data = 1;
+    if (ins.max_data_val > 0) ctx->saw_client_max_data = 1;
+    ctx->rx_total = s4_max_end;
+    return NULL;
+}
+
+/* Scenario 2B: Reliable Flow-Control Grant Recovery Under Loss
+ * - Server sends up to client's initial window limit (4096B) and stops WITHOUT sending BLOCKED
+ * - Drops client's standalone MAX_STREAM_DATA/MAX_DATA grant #1, drops retransmitted grant #2
+ *   (repeated grant loss), drops ACK for grant #3 (ACK loss), then accepts grant #4 and resumes
+ * - Drops a grant piggybacked onto a STREAM packet, then recovers both STREAM and grant via PTO
+ * - Drops an older grant (V3=10240), accepts and ACKs a newer grant (V4=12288) + 3 subsequent
+ *   packets so V3 crosses the 3-packet loss threshold, and verifies V3 loss never regresses or
+ *   re-sends the stale window value */
+struct hy2_grant_loss_srv_ctx {
+    int fd;
+    int paused_at_initial_limit;
+    int dropped_standalone_grant;
+    int dropped_grant_repeat;
+    int dropped_grant_ack;
+    int standalone_grant_recovered;
+    int primed_piggyback;
+    int dropped_piggybacked_grant;
+    int piggybacked_grant_recovered;
+    int dropped_stale_v3;
+    int saw_v4_grant;
+    int saw_stale_grant_regression;
+    uint64_t max_msd_seen;
+    uint64_t max_md_seen;
+    size_t rx_total;
+    unsigned char rx_stream[16384];
+    uint8_t rx_bitmap[16384];
+};
+
+static void hy2_send_srv_s4_To_limit(int fd, const unsigned char cli_scid[8],
+                                     const unsigned char s_ap[32], uint64_t *srv_pn,
+                                     size_t *srv_s4_sent, size_t limit) {
+    while (*srv_s4_sent < limit) {
+        size_t rem = limit - *srv_s4_sent;
+        size_t chunk = rem > 1024 ? 1024 : rem;
+        unsigned char sf[1100];
+        size_t so = 0;
+        size_t off = *srv_s4_sent;
+        sf[so++] = off ? 0x0E : 0x0A;
+        sf[so++] = 0x04;
+        if (off) so += hy2_put_varint(sf + so, off);
+        so += hy2_put_varint(sf + so, chunk);
+        for (size_t k = 0; k < chunk; k++) {
+            size_t pos = off + k;
+            if (pos < 3) {
+                sf[so + k] = 0x00; /* 3-byte HY2 TCP status header [0x00, 0x00, 0x00] */
+            } else {
+                size_t pay_idx = pos - 3;
+                sf[so + k] = (unsigned char)((pay_idx * 29 + 11) & 0xFF);
+            }
+        }
+        so += chunk;
+        *srv_s4_sent += chunk;
+        hy2_seal_1rtt(fd, cli_scid, s_ap, (*srv_pn)++, sf, so);
+    }
+}
+
+static void *hy2_grant_loss_srv_thread(void *arg) {
+    struct hy2_grant_loss_srv_ctx *ctx = arg;
+    unsigned char cli_scid[8], c_ap[32], s_ap[32];
+    uint64_t srv_pn = 0;
+    if (hy2_handshake_srv(ctx->fd, 65536, 65536, cli_scid, c_ap, s_ap, &srv_pn) != 0) return NULL;
+
+    struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN, .revents = 0 };
+    unsigned char dgram[2048];
+    struct hy2_rx_inspect ins;
+    memset(&ins, 0, sizeof(ins));
+    uint8_t srv_rx_pn[512];
+    memset(srv_rx_pn, 0, sizeof(srv_rx_pn));
+    srv_rx_pn[0] = 1; /* auth packet pn=0 */
+    uint64_t max_rx_pn = 0;
+
+    size_t s4_max_end = 0;
+    size_t hdr_len = 0;
+    size_t srv_s4_sent = 0;
+    size_t srv_peer_limit = 4096; /* client's initial local_s4_max_data (TUNVLESS_HY2_RX_WIN=4096) */
+
+    /* Wait for client's 14B HY2 TCP address header on Stream 4 */
+    while (s4_max_end < 14) {
+        if (poll(&pfd, 1, 1000) <= 0) return NULL;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) return NULL;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        if (pn < sizeof(srv_rx_pn)) srv_rx_pn[pn] = 1;
+        if (pn > max_rx_pn) max_rx_pn = pn;
+        hy2_parse_1rtt_frames(fp, flen, ctx->rx_stream, sizeof(ctx->rx_stream), &s4_max_end, ctx->rx_bitmap, &ins);
+        if (s4_max_end < 14) continue;
+        hdr_len = s4_max_end;
+        unsigned char ackf[64];
+        size_t ao = hy2_build_srv_ack(srv_rx_pn, max_rx_pn, ackf);
+        if (ao > 0) hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, ackf, ao);
+        break;
+    }
+
+    /* Send up to initial window limit (4096B on Stream 4 = 3B header + 4093B payload) and STOP without BLOCKED */
+    hy2_send_srv_s4_To_limit(ctx->fd, cli_scid, s_ap, &srv_pn, &srv_s4_sent, srv_peer_limit);
+    if (srv_s4_sent == 4096) ctx->paused_at_initial_limit = 1;
+
+    int v1_attempts = 0;
+    size_t target_cli_end = hdr_len + 3000;
+
+    for (int iter = 0; iter < 250; iter++) {
+        int cli_done = (s4_max_end >= target_cli_end);
+        if (cli_done) {
+            for (size_t k = hdr_len; k < target_cli_end; k++) {
+                if (!ctx->rx_bitmap[k]) { cli_done = 0; break; }
+            }
+        }
+        if (cli_done && srv_s4_sent == 8192 && ctx->saw_v4_grant) break;
+
+        if (poll(&pfd, 1, 150) <= 0) continue;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+
+        /* Inspect packet frames into temporary buffers before deciding whether to drop or accept */
+        unsigned char tmp_buf[16384];
+        uint8_t tmp_bm[16384];
+        size_t tmp_end = s4_max_end;
+        memcpy(tmp_bm, ctx->rx_bitmap, sizeof(tmp_bm));
+        int s4c = hy2_parse_1rtt_frames(fp, flen, tmp_buf, sizeof(tmp_buf), &tmp_end, tmp_bm, &ins);
+
+        /* Monotonic grant check: no received packet may ever carry a grant smaller than an already-seen grant */
+        if (ins.pkt_has_msd && ins.pkt_msd_val < ctx->max_msd_seen)
+            ctx->saw_stale_grant_regression = 1;
+        if (ins.pkt_has_md && ins.pkt_md_val < ctx->max_md_seen)
+            ctx->saw_stale_grant_regression = 1;
+
+        /* Phase A: Grant V1 (msd == 6144, standalone):
+         * Attempt 1: drop standalone grant
+         * Attempt 2: drop retransmitted grant (repeated grant loss)
+         * Attempt 3: drop server ACK (ACK loss)
+         * Attempt 4: accept, ACK, and resume server Stream 4 up to 6144 */
+        if (ins.pkt_has_msd && ins.pkt_msd_val == 6144) {
+            v1_attempts++;
+            if (v1_attempts == 1 && s4c == 0) {
+                ctx->dropped_standalone_grant = 1;
+                continue;
+            }
+            if (v1_attempts == 2) {
+                ctx->dropped_grant_repeat = 1;
+                continue;
+            }
+            if (v1_attempts == 3) {
+                ctx->dropped_grant_ack = 1;
+                continue;
+            }
+            ctx->standalone_grant_recovered = 1;
+        }
+
+        /* Phase B: Grant V2 (msd == 8192):
+         * First standalone arrival: drop so next client STREAM write piggybacks MAX_STREAM_DATA(8192)
+         * First piggybacked arrival (s4c > 0 && msd == 8192): drop entire piggybacked packet
+         * Second arrival (PTO retransmission of STREAM + MAX_STREAM_DATA(8192)): accept & resume to 8192 */
+        if (ins.pkt_has_msd && ins.pkt_msd_val == 8192) {
+            if (s4c == 0 && !ctx->primed_piggyback) {
+                ctx->primed_piggyback = 1;
+                continue;
+            }
+            if (s4c > 0 && !ctx->dropped_piggybacked_grant) {
+                ctx->dropped_piggybacked_grant = 1;
+                continue;
+            }
+            if (s4c > 0 && ctx->dropped_piggybacked_grant) {
+                ctx->piggybacked_grant_recovered = 1;
+            }
+        }
+
+        /* Phase C: Stale Grant V3 (msd == 10240) vs Newer Grant V4 (msd == 12288):
+         * Drop V3 (10240) so it stays in client sent_pkts while V4 (12288) is accepted and ACKed */
+        if (ins.pkt_has_msd && ins.pkt_msd_val == 10240 && !ctx->dropped_stale_v3) {
+            ctx->dropped_stale_v3 = 1;
+            continue;
+        }
+        if (ins.pkt_has_msd && ins.pkt_msd_val == 12288) {
+            ctx->saw_v4_grant = 1;
+        }
+
+        /* Accept packet */
+        if (pn < sizeof(srv_rx_pn)) srv_rx_pn[pn] = 1;
+        if (pn > max_rx_pn) max_rx_pn = pn;
+        hy2_parse_1rtt_frames(fp, flen, ctx->rx_stream, sizeof(ctx->rx_stream), &s4_max_end, ctx->rx_bitmap, &ins);
+
+        if (ins.pkt_has_msd && ins.pkt_msd_val > ctx->max_msd_seen)
+            ctx->max_msd_seen = ins.pkt_msd_val;
+        if (ins.pkt_has_md && ins.pkt_md_val > ctx->max_md_seen)
+            ctx->max_md_seen = ins.pkt_md_val;
+        if (ctx->max_msd_seen > srv_peer_limit) {
+            srv_peer_limit = (size_t)ctx->max_msd_seen;
+            if (srv_peer_limit > 8192) srv_peer_limit = 8192;
+        }
+
+        unsigned char ackf[128];
+        size_t ao = hy2_build_srv_ack(srv_rx_pn, max_rx_pn, ackf);
+        if (ao > 0)
+            hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, ackf, ao);
+
+        /* Resume sending server Stream 4 data up to the newly granted peer limit (without ever sending BLOCKED) */
+        hy2_send_srv_s4_To_limit(ctx->fd, cli_scid, s_ap, &srv_pn, &srv_s4_sent, srv_peer_limit);
+    }
+
+    ctx->rx_total = (s4_max_end >= hdr_len) ? (s4_max_end - hdr_len) : 0;
+    if (ctx->rx_total == 3000)
+        memmove(ctx->rx_stream, ctx->rx_stream + hdr_len, 3000);
+    return NULL;
+}
+
+/* Scenario 3: Multi-Fragment Hysteria2 UDP Datagram Send & Out-of-Order Reassembly */
+struct hy2_udp_srv_ctx {
+    int fd;
+    int got_all_3_frags;
+    size_t reassembled_len;
+    unsigned char reassembled[4096];
+};
+
+static void *hy2_udp_srv_thread(void *arg) {
+    struct hy2_udp_srv_ctx *ctx = arg;
+    unsigned char cli_scid[8], c_ap[32], s_ap[32];
+    uint64_t srv_pn = 0;
+    if (hy2_handshake_srv(ctx->fd, 0, 0, cli_scid, c_ap, s_ap, &srv_pn) != 0) return NULL;
+
+    struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN, .revents = 0 };
+    unsigned char dgram[2048];
+    struct hy2_rx_inspect ins;
+    uint8_t seen_frag[3] = {0, 0, 0};
+    uint16_t seen_pkt_id = 0;
+    uint32_t cli_sid = 0;
+
+    for (int i = 0; i < 20; i++) {
+        if (seen_frag[0] && seen_frag[1] && seen_frag[2]) break;
+        if (poll(&pfd, 1, 200) <= 0) continue;
+        ssize_t nr = recv(ctx->fd, dgram, sizeof(dgram), 0);
+        if (nr <= 0) break;
+        uint64_t pn = 0; const unsigned char *fp = NULL; size_t flen = 0;
+        if (hy2_open_1rtt(dgram, (size_t)nr, c_ap, &pn, &fp, &flen) != 0) continue;
+        memset(&ins, 0, sizeof(ins));
+        size_t dummy_end = 0;
+        hy2_parse_1rtt_frames(fp, flen, NULL, 0, &dummy_end, NULL, &ins);
+        if (ins.saw_dgram && ins.dgram_len > 8) {
+            const unsigned char *dp = ins.dgram_buf;
+            cli_sid = ((uint32_t)dp[0] << 24) | ((uint32_t)dp[1] << 16) | ((uint32_t)dp[2] << 8) | dp[3];
+            uint16_t pid = (uint16_t)(((uint16_t)dp[4] << 8) | dp[5]);
+            uint8_t fid = dp[6], fcnt = dp[7];
+            uint64_t alen = 0; size_t ac = 0;
+            if (fcnt == 3 && fid < 3 && hy2_get_varint(dp + 8, ins.dgram_len - 8, &alen, &ac) == 0) {
+                size_t pay_off = 8 + ac + (size_t)alen;
+                size_t pay_len = ins.dgram_len - pay_off;
+                if (seen_pkt_id == 0) seen_pkt_id = pid;
+                if (pid == seen_pkt_id) {
+                    seen_frag[fid] = 1;
+                    memcpy(ctx->reassembled + (size_t)fid * 1100, dp + pay_off, pay_len);
+                    ctx->reassembled_len += pay_len;
+                }
+            }
+        }
+    }
+
+    if (seen_frag[0] && seen_frag[1] && seen_frag[2]) {
+        ctx->got_all_3_frags = 1;
+        /* Send a 2400-byte UDP datagram back in 3 OUT-OF-ORDER fragments (frag_id = 2, 0, 1) */
+        int send_order[3] = { 2, 0, 1 };
+        for (int idx = 0; idx < 3; idx++) {
+            int fid = send_order[idx];
+            unsigned char df[1000];
+            size_t doff = 0;
+            df[doff++] = 0x31; /* DATAGRAM with length */
+            const char *addr_s = "1.1.1.1:53";
+            size_t alen = strlen(addr_s);
+            size_t body_len = 4 + 2 + 1 + 1 + 1 + alen + 800;
+            doff += hy2_put_varint(df + doff, body_len);
+            df[doff++] = (unsigned char)(cli_sid >> 24);
+            df[doff++] = (unsigned char)(cli_sid >> 16);
+            df[doff++] = (unsigned char)(cli_sid >> 8);
+            df[doff++] = (unsigned char)cli_sid;
+            df[doff++] = 0x77; df[doff++] = 0x88; /* pkt_id = 0x7788 */
+            df[doff++] = (unsigned char)fid;
+            df[doff++] = 3; /* frag_count = 3 */
+            df[doff++] = (unsigned char)alen;
+            memcpy(df + doff, addr_s, alen); doff += alen;
+            for (size_t k = 0; k < 800; k++) {
+                df[doff + k] = (unsigned char)(((size_t)fid * 800 + k) & 0xFF);
+            }
+            doff += 800;
+            hy2_seal_1rtt(ctx->fd, cli_scid, s_ap, srv_pn++, df, doff);
+        }
+    }
+    return NULL;
+}
+#endif /* STEER_HAVE_X509WRITE */
 
 /* One run: make a socket pair, give one end to the client and the other to the server half.
  *
@@ -3279,6 +4694,396 @@ int main(void) {
         }
         t_fm_sd();
         cc_tests();
+        /* Hysteria2 audit & full QUIC v1 engine tests (B1, B2, B3):
+         * - B2: Enabled by default with full QUIC v1 engine, and can be gated off with vless_set_enable_hy2(0)
+         * - B1: Server Finished without Certificate or CertificateVerify is rejected with TLS13_ECERT
+         *       and never sends 1-RTT auth credentials
+         * - B1 + B3: Out-of-order CRYPTO frames + HTTP/3 Stream 0 QPACK :status=200 with "233" in x-pad
+         *       is rejected, while split out-of-order :status=233 succeeds
+         * - B2 Full QUIC:
+         *     1) RFC 9002 packet-threshold loss detection + PTO tail recovery + multi-range SACK + duplicate PN suppression
+         *     2) QUIC send & receive flow control (EncryptedExtensions TP, STREAM_DATA_BLOCKED, MAX_STREAM_DATA, MAX_DATA)
+         *     3) Multi-fragment Hysteria2 UDP datagram fragmentation & out-of-order reassembly */
+        {
+            struct vless_node hyn;
+            memset(&hyn, 0, sizeof(hyn));
+            snprintf(hyn.proto, sizeof(hyn.proto), "%s", "hy2");
+            snprintf(hyn.host, sizeof(hyn.host), "%s", "node.invalid");
+            hyn.port = 8443;
+            snprintf(hyn.uuid, sizeof(hyn.uuid), "%s", "hy2-secret");
+            snprintf(hyn.type, sizeof(hyn.type), "%s", "quic");
+            snprintf(hyn.security, sizeof(hyn.security), "%s", "tls");
+            snprintf(hyn.sni, sizeof(hyn.sni), "%s", TLS_SNI);
+
+            check("hy2 B2: disabled by default", 0, vless_enable_hy2());
+            struct transport c;
+            check("hy2 B2: refused when disabled by default in transport_open", TR_ENONODE,
+                  vless_connect(&hyn, &c, 2));
+
+            vless_set_enable_hy2(1);
+            int fd0 = fd_count(), got_1rtt = -1;
+            check("hy2 B1: Finished without Certificate refused with TLS13_ECERT",
+                  TLS13_ECERT, run_hy2_mock(HY2_MOCK_NO_CERT, &got_1rtt));
+            check("hy2 B1: no 1-RTT auth sent without Certificate", 0, got_1rtt);
+
+            got_1rtt = -1;
+            check("hy2 B1: Finished without CertificateVerify refused with TLS13_ECERT",
+                  TLS13_ECERT, run_hy2_mock(HY2_MOCK_NO_CV, &got_1rtt));
+            check("hy2 B1: no 1-RTT auth sent without CertificateVerify", 0, got_1rtt);
+
+            got_1rtt = 0;
+            check("hy2 B3: :status=200 with '233' in header value refused",
+                  TR_ECLOSED, run_hy2_mock(HY2_MOCK_STATUS_200_FAKE_233, &got_1rtt));
+            check("hy2 B3: handshake completed before auth check", 1, got_1rtt);
+
+            got_1rtt = 0;
+            check("hy2 B1+B3: out-of-order CRYPTO & split Stream 0 :status=233 succeeds",
+                  0, run_hy2_mock(HY2_MOCK_OOO_SPLIT_233_OK, &got_1rtt));
+
+            /* B2 Scenario 1: Loss Recovery (Packet Threshold + PTO Tail), Multi-Range SACK, Dup PN Suppression */
+            {
+                int sv[2];
+                check("hy2 B2 loss: socketpair", 0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+                struct hy2_loss_srv_ctx *lctx = calloc(1, sizeof(*lctx));
+                lctx->fd = sv[1];
+                pthread_t th;
+                pthread_create(&th, NULL, hy2_loss_srv_thread, lctx);
+
+                g_give_fd = sv[0];
+                g_tcp_dial = fake_dial;
+                struct transport tc;
+                int orc = vless_connect(&hyn, &tc, 2);
+                g_tcp_dial = NULL;
+                check("hy2 B2 loss: vless_connect", 0, orc);
+                if (orc == 0) {
+                    /* Send TCP address header: [ATYP=0x01][1.2.3.4][port=80] */
+                    unsigned char ahdr[7] = { 0x01, 1, 2, 3, 4, 0, 80 };
+                    check("hy2 B2 loss: write addr header", 0, transport_write(&tc, ahdr, 7));
+
+                    /* Read 8000 bytes sent out-of-order and with duplicate PNs by server */
+                    unsigned char rx_stream_cli[8000];
+                    size_t rx_got = 0;
+                    struct pollfd cpfd = { .fd = tc.link.fd, .events = POLLIN, .revents = 0 };
+                    for (int tries = 0; tries < 60 && rx_got < 8000; tries++) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 50);
+                        size_t step_got = 0;
+                        if (transport_read(&tc, rx_stream_cli + rx_got, 8000 - rx_got, &step_got) == 0 && step_got > 0)
+                            rx_got += step_got;
+                    }
+                    check("hy2 B2 loss: client received all 8000 OOO server bytes", 8000, (int)rx_got);
+                    int rx_match = 1;
+                    for (int ch_i = 0; ch_i < 8; ch_i++) {
+                        for (size_t k = 0; k < 1000; k++) {
+                            unsigned char exp = (unsigned char)((ch_i * 37 + k) & 0xFF);
+                            if (rx_stream_cli[ch_i * 1000 + k] != exp) { rx_match = 0; break; }
+                        }
+                    }
+                    check("hy2 B2 loss: OOO + duplicate-PN server stream reassembled exact", 1, rx_match);
+
+                    /* Now write 16000 bytes in 8 chunks of 2000 bytes; server drops packet #2 (SACK threshold)
+                     * and drops the final packet (PTO tail loss). Pump transport_room/read until server gets all! */
+                    unsigned char tx_stream_cli[16000];
+                    for (size_t i = 0; i < sizeof(tx_stream_cli); i++)
+                        tx_stream_cli[i] = (unsigned char)((i * 13 + 7) & 0xFF);
+                    size_t tx_sent = 0;
+                    while (tx_sent < sizeof(tx_stream_cli)) {
+                        size_t chunk = sizeof(tx_stream_cli) - tx_sent;
+                        if (chunk > 2000) chunk = 2000;
+                        if (transport_write(&tc, tx_stream_cli + tx_sent, chunk) != 0) break;
+                        tx_sent += chunk;
+                    }
+                    check("hy2 B2 loss: client queued all 16000 bytes", 16000, (int)tx_sent);
+
+                    /* Drive QUIC loss detection & PTO timer via transport_read / transport_room while waiting */
+                    for (int pump = 0; pump < 80 && !lctx->ok; pump++) {
+                        if (poll(&cpfd, 1, 25) > 0) {
+                            unsigned char tmp[256];
+                            size_t sg = 0;
+                            (void)transport_read(&tc, tmp, sizeof(tmp), &sg);
+                        } else {
+                            (void)transport_room(&tc);
+                        }
+                    }
+                    transport_close(&tc);
+                }
+                pthread_join(th, NULL);
+                close(sv[1]);
+
+                check("hy2 B2 loss: client emitted multi-range SACK (rcnt >= 1)", 1, lctx->saw_multi_sack);
+                check("hy2 B2 loss: server dropped packet #2 (packet-threshold test)", 1, lctx->dropped_pkt_threshold);
+                check("hy2 B2 loss: server dropped tail packet (PTO probe test)", 1, lctx->dropped_tail_pto);
+                check("hy2 B2 loss: all client retransmissions used strictly increasing PNs", 1, lctx->saw_monotonic_retx_pn);
+                check("hy2 B2 loss: server recovered all 16000 client bytes", 1, lctx->ok);
+                int tx_match = 1;
+                for (size_t i = 0; i < 16000; i++) {
+                    if (lctx->rx_stream[i] != (unsigned char)((i * 13 + 7) & 0xFF)) { tx_match = 0; break; }
+                }
+                check("hy2 B2 loss: recovered client stream matches byte-for-byte", 1, tx_match);
+                free(lctx);
+            }
+
+            /* B2 Scenario 2: QUIC Flow Control (Send & Receive Window Credit & STREAM_DATA_BLOCKED) */
+            {
+                int sv[2];
+                check("hy2 B2 flowctl: socketpair", 0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+                struct hy2_fc_srv_ctx fctx;
+                memset(&fctx, 0, sizeof(fctx));
+                fctx.fd = sv[1];
+                pthread_t th;
+                pthread_create(&th, NULL, hy2_fc_srv_thread, &fctx);
+
+                g_give_fd = sv[0];
+                g_tcp_dial = fake_dial;
+                struct transport tc;
+                int orc = vless_connect(&hyn, &tc, 2);
+                g_tcp_dial = NULL;
+                check("hy2 B2 flowctl: vless_connect", 0, orc);
+                if (orc == 0) {
+                    unsigned char ahdr[7] = { 0x01, 1, 2, 3, 4, 0, 80 };
+                    (void)transport_write(&tc, ahdr, 7);
+                    unsigned char payload[6000];
+                    memset(payload, 0x42, sizeof(payload));
+                    int wrc = transport_write(&tc, payload, sizeof(payload));
+                    check("hy2 B2 flowctl: buffered 6000-byte write", 0, wrc);
+
+                    /* Read 20000 bytes from server so client replenishes receive flow-control window */
+                    struct pollfd cpfd = { .fd = tc.link.fd, .events = POLLIN, .revents = 0 };
+                    unsigned char rbuf[2048];
+                    size_t rgot = 0;
+                    for (int i = 0; i < 80 && rgot < 20000; i++) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 30);
+                        size_t sg = 0;
+                        if (transport_read(&tc, rbuf, sizeof(rbuf), &sg) == 0 && sg > 0) rgot += sg;
+                        (void)transport_room(&tc);
+                    }
+                    check("hy2 B2 flowctl: client read all 20000 server bytes", 20000, (int)rgot);
+                    for (int w = 0; w < 30 && (!fctx.resumed_after_max_stream_data || !fctx.saw_client_max_stream_data); w++) {
+                        poll(&cpfd, 1, 10);
+                        (void)transport_room(&tc);
+                    }
+                    transport_close(&tc);
+                }
+                pthread_join(th, NULL);
+                close(sv[1]);
+
+                check("hy2 B2 flowctl: initial burst capped at server TP initial_max_stream_data (1500)",
+                      1, fctx.capped_at_initial_window);
+                check("hy2 B2 flowctl: client emitted STREAM_DATA_BLOCKED (0x15)",
+                      1, fctx.saw_stream_data_blocked);
+                check("hy2 B2 flowctl: client resumed Stream 4 after MAX_STREAM_DATA grant",
+                      1, fctx.resumed_after_max_stream_data);
+                check("hy2 B2 flowctl: client emitted MAX_STREAM_DATA (0x11) on receive consumption",
+                      1, fctx.saw_client_max_stream_data);
+                check("hy2 B2 flowctl: client emitted MAX_DATA (0x10) on receive consumption",
+                      1, fctx.saw_client_max_data);
+            }
+
+            /* B2 Scenario 2B: Flow-Control Grant Loss Recovery (Standalone, Piggybacked, Repeated Grant/ACK Loss, Stale Non-Regression) */
+            {
+                int sv[2];
+                check("hy2 B2 grant-loss: socketpair", 0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+                struct hy2_grant_loss_srv_ctx *gctx = calloc(1, sizeof(*gctx));
+                gctx->fd = sv[1];
+                pthread_t th;
+                pthread_create(&th, NULL, hy2_grant_loss_srv_thread, gctx);
+
+                setenv("TUNVLESS_HY2_RX_WIN", "4096", 1);
+                g_give_fd = sv[0];
+                g_tcp_dial = fake_dial;
+                struct transport tc;
+                int64_t t_start_ms = now_ms();
+                int orc = vless_connect(&hyn, &tc, 2);
+                g_tcp_dial = NULL;
+                unsetenv("TUNVLESS_HY2_RX_WIN");
+                check("hy2 B2 grant-loss: vless_connect", 0, orc);
+
+                unsigned char cli_rx_all[8189];
+                size_t cli_rx_got = 0;
+                unsigned char cli_tx_all[3000];
+                for (size_t i = 0; i < sizeof(cli_tx_all); i++)
+                    cli_tx_all[i] = (unsigned char)((i * 23 + 5) & 0xFF);
+
+                if (orc == 0) {
+                    struct pollfd cpfd = { .fd = tc.link.fd, .events = POLLIN, .revents = 0 };
+                    unsigned char ahdr[7] = { 0x01, 1, 2, 3, 4, 0, 80 };
+                    check("hy2 B2 grant-loss: write addr header", 0, transport_write(&tc, ahdr, 7));
+
+                    /* 1. Wait until initial 4093B payload arrives, then read 2045B (3+2045=2048B consumed -> V1=6144) */
+                    while (cli_rx_got < 2045) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 25);
+                        size_t sg = 0;
+                        if (transport_read(&tc, cli_rx_all + cli_rx_got, 2045 - cli_rx_got, &sg) == 0 && sg > 0)
+                            cli_rx_got += sg;
+                    }
+                    check("hy2 B2 grant-loss: read first 2045B triggering standalone grant V1=6144", 2045, (int)cli_rx_got);
+
+                    /* Pump PTO timer while server drops standalone grant #1, drops repeat #2, drops ACK #3, and accepts #4 */
+                    for (int w = 0; w < 80 && !gctx->standalone_grant_recovered; w++) {
+                        poll(NULL, 0, 15);
+                        (void)transport_room(&tc);
+                    }
+                    /* Drain server ACK for attempt #4 and incoming 4096..6144 stream packets so pto_count resets to 0 */
+                    for (int w = 0; w < 20; w++) {
+                        if (poll(&cpfd, 1, 5) <= 0) break;
+                        (void)transport_room(&tc);
+                    }
+
+                    /* 2. Read next 2048B (s4_rx_consumed=4096 -> V2=8192); server drops standalone V2 so next write piggybacks V2 */
+                    while (cli_rx_got < 4093) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 25);
+                        size_t sg = 0;
+                        if (transport_read(&tc, cli_rx_all + cli_rx_got, 4093 - cli_rx_got, &sg) == 0 && sg > 0)
+                            cli_rx_got += sg;
+                    }
+                    for (int w = 0; w < 30 && !gctx->primed_piggyback; w++)
+                        poll(NULL, 0, 2);
+                    /* Wait for PTO (>120ms) to expire on standalone V2, then write 1000B so hy2_queue_stream4 -> hy2_tick
+                     * PTO detects standalone V2 loss and coalesces MAX_STREAM_DATA(8192) + MAX_DATA(12288) with STREAM */
+                    poll(NULL, 0, 200);
+                    check("hy2 B2 grant-loss: write 1000B with piggybacked grant V2=8192", 0,
+                          transport_write(&tc, cli_tx_all, 1000));
+
+                    /* Pump PTO while server drops the piggybacked STREAM+grant packet and recovers both on PTO */
+                    for (int w = 0; w < 80 && !gctx->piggybacked_grant_recovered; w++) {
+                        poll(NULL, 0, 25);
+                        (void)transport_room(&tc);
+                    }
+
+                    /* 3. Wait for remaining server bytes (up to 8189B total payload):
+                     * Read 2048B (s4_rx_consumed=6144 -> V3=10240, dropped by server)
+                     * Then immediately read final 2048B (s4_rx_consumed=8192 -> V4=12288, accepted & ACKed by server) */
+                    while (cli_rx_got < 6141) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 25);
+                        size_t sg = 0;
+                        if (transport_read(&tc, cli_rx_all + cli_rx_got, 6141 - cli_rx_got, &sg) == 0 && sg > 0)
+                            cli_rx_got += sg;
+                    }
+                    while (cli_rx_got < 8189) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 25);
+                        size_t sg = 0;
+                        if (transport_read(&tc, cli_rx_all + cli_rx_got, 8189 - cli_rx_got, &sg) == 0 && sg > 0)
+                            cli_rx_got += sg;
+                    }
+                    check("hy2 B2 grant-loss: client received all 8189 server payload bytes after grant recoveries",
+                          8189, (int)cli_rx_got);
+
+                    /* 4. Send 4 more 500B chunks (total 3000B client payload) so 3 ACKs after V3 mark stale V3 lost */
+                    for (int c_i = 0; c_i < 4; c_i++) {
+                        check("hy2 B2 grant-loss: write 500B chunk after V4", 0,
+                              transport_write(&tc, cli_tx_all + 1000 + c_i * 500, 500));
+                        poll(&cpfd, 1, 10);
+                        (void)transport_room(&tc);
+                    }
+                    for (int w = 0; w < 40 && gctx->rx_total < 3000; w++) {
+                        poll(&cpfd, 1, 15);
+                        (void)transport_room(&tc);
+                    }
+                    transport_close(&tc);
+                }
+                pthread_join(th, NULL);
+                int64_t elapsed_ms = now_ms() - t_start_ms;
+                close(sv[1]);
+
+                check("hy2 B2 grant-loss: server paused at initial 4096B window without sending BLOCKED",
+                      1, gctx->paused_at_initial_limit);
+                check("hy2 B2 grant-loss: standalone MAX_STREAM_DATA/MAX_DATA grant dropped",
+                      1, gctx->dropped_standalone_grant);
+                check("hy2 B2 grant-loss: repeated grant loss injected",
+                      1, gctx->dropped_grant_repeat);
+                check("hy2 B2 grant-loss: grant ACK loss injected",
+                      1, gctx->dropped_grant_ack);
+                check("hy2 B2 grant-loss: standalone grant recovered via PTO and unblocked server",
+                      1, gctx->standalone_grant_recovered);
+                check("hy2 B2 grant-loss: piggybacked STREAM + MAX_STREAM_DATA/MAX_DATA packet dropped",
+                      1, gctx->dropped_piggybacked_grant);
+                check("hy2 B2 grant-loss: piggybacked STREAM + grant recovered together",
+                      1, gctx->piggybacked_grant_recovered);
+                check("hy2 B2 grant-loss: older V3(10240) grant dropped before V4(12288) ACKed",
+                      1, gctx->dropped_stale_v3 && gctx->saw_v4_grant);
+                check("hy2 B2 grant-loss: losing older V3 grant never regressed or re-sent stale window",
+                      0, gctx->saw_stale_grant_regression);
+                check("hy2 B2 grant-loss: final server max_stream_data is V4 (12288)",
+                      12288, (int)gctx->max_msd_seen);
+                check("hy2 B2 grant-loss: final server max_data is 16384",
+                      16384, (int)gctx->max_md_seen);
+                int srv_rx_match = (cli_rx_got == 8189);
+                for (size_t i = 0; i < 8189 && srv_rx_match; i++) {
+                    if (cli_rx_all[i] != (unsigned char)((i * 29 + 11) & 0xFF)) srv_rx_match = 0;
+                }
+                check("hy2 B2 grant-loss: server->client 8189B stream matches byte-for-byte", 1, srv_rx_match);
+                int cli_tx_match = (gctx->rx_total == 3000);
+                for (size_t i = 0; i < 3000 && cli_tx_match; i++) {
+                    if (gctx->rx_stream[i] != cli_tx_all[i]) cli_tx_match = 0;
+                }
+                check("hy2 B2 grant-loss: client->server 3000B stream matches byte-for-byte", 1, cli_tx_match);
+                check("hy2 B2 grant-loss: bounded recovery completion time (< 2000 ms)",
+                      1, elapsed_ms > 0 && elapsed_ms < 2000);
+                free(gctx);
+            }
+
+            /* B2 Scenario 3: Multi-Fragment Hysteria2 UDP Datagram Send & Out-of-Order Reassembly */
+            {
+                int sv[2];
+                check("hy2 B2 udp-frag: socketpair", 0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+                struct hy2_udp_srv_ctx uctx;
+                memset(&uctx, 0, sizeof(uctx));
+                uctx.fd = sv[1];
+                pthread_t th;
+                pthread_create(&th, NULL, hy2_udp_srv_thread, &uctx);
+
+                g_give_fd = sv[0];
+                g_tcp_dial = fake_dial;
+                struct transport tc;
+                int orc = vless_connect(&hyn, &tc, 2);
+                g_tcp_dial = NULL;
+                check("hy2 B2 udp-frag: vless_connect", 0, orc);
+                if (orc == 0) {
+                    /* Open UDP mode: [0x81 (UDP | IPv4)][1.1.1.1][port=53] */
+                    unsigned char uhdr[7] = { 0x81, 1, 1, 1, 1, 0, 53 };
+                    check("hy2 B2 udp-frag: write UDP addr header", 0, transport_write(&tc, uhdr, 7));
+
+                    /* Send a 2500-byte UDP datagram payload (split into 3 QUIC DATAGRAM fragments of 1100, 1100, 300B) */
+                    unsigned char udgram[2500];
+                    for (size_t i = 0; i < 2500; i++) udgram[i] = (unsigned char)((i * 19 + 3) & 0xFF);
+                    check("hy2 B2 udp-frag: write 2500B UDP datagram", 0,
+                          transport_write(&tc, udgram, sizeof(udgram)));
+
+                    /* Read 2400-byte UDP datagram sent back in 3 out-of-order fragments by server */
+                    struct pollfd cpfd = { .fd = tc.link.fd, .events = POLLIN, .revents = 0 };
+                    unsigned char urx[2 + 2400];
+                    size_t ugot = 0;
+                    for (int i = 0; i < 40 && ugot < sizeof(urx); i++) {
+                        if (!transport_has_data(&tc)) poll(&cpfd, 1, 50);
+                        size_t sg = 0;
+                        if (transport_read(&tc, urx + ugot, sizeof(urx) - ugot, &sg) == 0 && sg > 0)
+                            ugot += sg;
+                    }
+                    check("hy2 B2 udp-frag: received reassembled 2402B UDP frame", 2402, (int)ugot);
+                    int ulen_hdr = ((int)urx[0] << 8) | urx[1];
+                    check("hy2 B2 udp-frag: reassembled UDP length prefix is 2400", 2400, ulen_hdr);
+                    int umatch = 1;
+                    for (size_t i = 0; i < 2400; i++) {
+                        if (urx[2 + i] != (unsigned char)(i & 0xFF)) { umatch = 0; break; }
+                    }
+                    check("hy2 B2 udp-frag: out-of-order UDP fragments reassembled byte-for-byte", 1, umatch);
+                    transport_close(&tc);
+                }
+                pthread_join(th, NULL);
+                close(sv[1]);
+
+                check("hy2 B2 udp-frag: server received all 3 fragments from client", 1, uctx.got_all_3_frags);
+                check("hy2 B2 udp-frag: server reassembled 2500B from client", 2500, (int)uctx.reassembled_len);
+                int cmatch = 1;
+                for (size_t i = 0; i < 2500; i++) {
+                    if (uctx.reassembled[i] != (unsigned char)((i * 19 + 3) & 0xFF)) { cmatch = 0; break; }
+                }
+                check("hy2 B2 udp-frag: client fragmented UDP payload matches byte-for-byte", 1, cmatch);
+            }
+
+            vless_set_enable_hy2(0);
+            check("hy2 B1+B2+B3: descriptor count restored", fd0, fd_count());
+            check("hy2 B1+B2+B3: nothing left on the heap", 0, LEAK_CHECK());
+        }
         g_cert_roots = NULL;
         chain_free();
     }
@@ -3697,6 +5502,44 @@ int main(void) {
         close(sv[1]);
         check("vmess B4: nothing left on the heap", 0, LEAK_CHECK());
     }
+    {
+        int fds0 = fd_count();
+        /* Regression: hy2 transport_open initializes struct transport before disabled gate check,
+         * and rejects overlong SNI (>255B) cleanly without buffer overflow or fd/heap leak. */
+        vless_set_enable_hy2(0);
+        struct transport hy_uninit;
+        memset(&hy_uninit, 0x5A, sizeof(hy_uninit));
+        struct tr_node htn;
+        memset(&htn, 0, sizeof(htn));
+        htn.proto = "hy2";
+        htn.host = "127.0.0.1";
+        htn.port = 8443;
+        htn.type = "quic";
+        htn.security = "tls";
+        htn.uuid = "secret";
+        check("hy2 disabled: transport_open returns TR_ENONODE", TR_ENONODE,
+              transport_open(&hy_uninit, &htn, 1));
+        transport_close(&hy_uninit); /* must not crash on uninitialized fields */
+
+        vless_set_enable_hy2(1);
+        char overlong_sni[301];
+        memset(overlong_sni, 'a', 300);
+        overlong_sni[300] = '\0';
+        htn.sni = overlong_sni;
+        int hysv[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, hysv) != 0) return 2;
+        g_give_fd = hysv[0];
+        g_tcp_dial = fake_dial;
+        struct transport hy_long;
+        int hyrc = transport_open(&hy_long, &htn, 1);
+        g_tcp_dial = NULL;
+        close(hysv[1]);
+        vless_set_enable_hy2(0);
+        check("hy2 overlong sni (>255B): rejected with TR_EIO", TR_EIO, hyrc);
+        check("hy2 overlong sni: no leaked descriptors", fds0, fd_count());
+        check("hy2 overlong sni: nothing left on the heap", 0, LEAK_CHECK());
+    }
+
 #if !defined(__SANITIZE_ADDRESS__)
     printf("\nWARNING: built WITHOUT AddressSanitizer: the 'nothing left on the heap' checks\n");
     printf("         are vacuous. Return codes and descriptors are checked, the heap is NOT.\n");

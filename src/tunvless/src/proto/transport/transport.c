@@ -156,9 +156,13 @@ extern int vless_enable_hy2(void);
 
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     if (n->proto && !strcmp(n->proto, "hy2")) {
+        t->fr = &tr_hy2;
         memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
         t->link.fd = -1;
-        return TR_ENONODE;
+        if (!vless_enable_hy2()) return TR_ENONODE;
+        int rc = t->fr->open(t, n, timeout_s);
+        if (rc) { transport_close(t); return rc; }
+        return 0;
     }
     int is_h2_connect = n->proto && (!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive"));
     t->fr = is_h2_connect ? &tr_tt : transport_of(n->type);
