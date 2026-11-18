@@ -121,7 +121,7 @@ TEST a_body_of_hysteria2_nodes_gives_rows(void)
     static const char body[] = "vless://u@h.example:443?security=none#v\n"
                                "hysteria2://pw@h.example:443/?sni=s.example#a\n"
                                "hy2://pw@h2.example:443/?sni=s.example#b\n"
-                               "trojan://p@h.example:1#t\n";
+                               "tuic://p@h.example:1#t\n";
     firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:v", "aaaaaaaa:a", "aaaaaaaa:b"};

@@ -292,12 +292,72 @@ static int link_build(const struct vless_node *n, struct wbuf *w0) {
     if (n->skip_reason[0] || !n->port || !n->host[0]) return -1;
     if (n->proto == VLESS_PROTO_HY2) return hy2_link_build(n, w0);
     int v6 = strchr(n->host, ':') != NULL;
-    if (!clean(n->uuid, "@") || !clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return -1;
+    if (!clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return -1;
     if (v6 && strspn(n->host, "0123456789abcdefABCDEF:.") != strlen(n->host)) return -1;
     struct wbuf w = *w0;
     if (w.p) w.p[0] = '\0';
-    puts_(&w, "vless://");
-    puts_(&w, n->uuid);
+    if (!strcmp(n->proto_str, "socks5")) {
+        puts_(&w, "socks5://");
+        if (n->uuid[0]) {
+            const char *col = strchr(n->uuid, ':');
+            if (col) {
+                char u[128];
+                size_t ul = (size_t)(col - n->uuid);
+                if (ul >= sizeof(u)) ul = sizeof(u) - 1;
+                memcpy(u, n->uuid, ul);
+                u[ul] = '\0';
+                put_pct(&w, u);
+                put(&w, ":", 1);
+                put_pct(&w, col + 1);
+            } else {
+                put_pct(&w, n->uuid);
+            }
+            put(&w, "@", 1);
+        }
+        if (v6) put(&w, "[", 1);
+        puts_(&w, n->host);
+        if (v6) put(&w, "]", 1);
+        char port[8];
+        snprintf(port, sizeof port, ":%u", n->port);
+        puts_(&w, port);
+        if (n->name[0]) {
+            put(&w, "#", 1);
+            put_name(&w, n->name);
+        }
+        *w0 = w;
+        return w.bad ? -1 : 0;
+    }
+    if (!strcmp(n->proto_str, "trojan") || !strcmp(n->proto_str, "ss") || !strcmp(n->proto_str, "naive") ||
+        !strcmp(n->proto_str, "vmess") || !strcmp(n->proto_str, "mieru") ||
+        !strcmp(n->proto_str, "anytls")) {
+        if (!strcmp(n->proto_str, "trojan")) puts_(&w, "trojan://");
+        else if (!strcmp(n->proto_str, "ss")) puts_(&w, "ss://");
+        else if (!strcmp(n->proto_str, "vmess")) puts_(&w, "vmess://");
+        else if (!strcmp(n->proto_str, "mieru")) puts_(&w, "mierus://");
+        else if (!strcmp(n->proto_str, "anytls")) puts_(&w, "anytls://");
+        else puts_(&w, "naive+https://");
+        const char *col = strchr(n->uuid, ':');
+        if (col && strcmp(n->proto_str, "trojan") != 0 && strcmp(n->proto_str, "anytls") != 0) {
+            char u[128];
+            size_t ul = (size_t)(col - n->uuid);
+            if (ul >= sizeof(u)) ul = sizeof(u) - 1;
+            memcpy(u, n->uuid, ul);
+            u[ul] = '\0';
+            put_pct(&w, u);
+            put(&w, ":", 1);
+            put_pct(&w, col + 1);
+        } else {
+            put_pct(&w, n->uuid);
+        }
+    } else {
+        if (!clean(n->uuid, "@")) return -1;
+        if (!strcmp(n->proto_str, "tt")) {
+            puts_(&w, "tt://");
+        } else {
+            puts_(&w, "vless://");
+        }
+        puts_(&w, n->uuid);
+    }
     put(&w, "@", 1);
     if (v6) put(&w, "[", 1);
     puts_(&w, n->host);
@@ -315,9 +375,26 @@ static int link_build(const struct vless_node *n, struct wbuf *w0) {
     param(&w, "path", n->path);
     param(&w, "serviceName", n->service);
     param(&w, "mode", n->mode);
+    if (!strcmp(n->mode, "finiteproto")) {
+        if (n->fp_id[0]) param(&w, "fp_id", n->fp_id);
+        if (n->fp_secret[0]) param(&w, "fp_secret", n->fp_secret);
+        if (n->fp_method[0]) param(&w, "fp_method", n->fp_method);
+        if (n->fp_chunk) {
+            char b[16];
+            snprintf(b, sizeof(b), "%u", n->fp_chunk);
+            param(&w, "fp_chunk", b);
+        }
+        if (n->fp_conc) {
+            char b[8];
+            snprintf(b, sizeof(b), "%u", n->fp_conc);
+            param(&w, "fp_conc", b);
+        }
+        param(&w, "fp_v", "2");
+    }
     param(&w, "host", n->http_host);
     param(&w, "headers", n->headers);
     if (n->tcp_http) param(&w, "headerType", "http");
+    if (n->record_fragment) param(&w, "record_fragment", "1");
     extra(&w, n);
     param_long(&w, "pqv", n->pqv);
     param_long(&w, "encryption", n->encryption);

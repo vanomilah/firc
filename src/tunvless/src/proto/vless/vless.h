@@ -21,9 +21,11 @@ struct vless_node {
     char name[128];        /* display name: the #fragment (decoded), remarks, tag or name */
     char host[128];
     uint16_t port;
-    char uuid[64];
-    char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade */
+    char proto_str[16];    /* empty or vless | tt | socks5 | trojan | ss | naive | vmess | mieru | anytls */
+    char uuid[128];        /* VLESS UUID, or user:pass for tt / socks5 */
+    char type[16];         /* tcp | grpc | xhttp | ws | httpupgrade | h2 */
     char security[16];     /* none | tls | reality */
+    uint8_t record_fragment; /* TLS ClientHello record fragmentation (TrustTunnel anti_dpi) */
     char sni[128];         /* SNI of the ClientHello; for reality, the camouflage domain */
     char fp[16];           /* browser fingerprint: chrome, firefox, qq… */
     char pbk[64];          /* server public key, base64url */
@@ -74,6 +76,12 @@ struct vless_node {
     uint8_t tcp_http;
     const char *xhx;
     const struct vless_node *dl;
+    /* FiniteProto v2 transport fields */
+    char fp_id[64];
+    char fp_secret[68];
+    char fp_method[16];
+    uint32_t fp_chunk;
+    uint8_t fp_conc;
     /* Certificate check of a security=tls node (Xray-core: pinnedPeerCertSha256 / `pcs`,
      * verifyPeerCertByName / `vcn`; sing-box: certificate_public_key_sha256). Interned strings
      * (sl_intern), NULL — no such field. pcs and pks — lowercase hex SHA-256, comma separated:

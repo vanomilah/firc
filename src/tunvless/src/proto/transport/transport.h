@@ -69,6 +69,8 @@
 /* The node as the transport sees it: only what concerns the connection. The pointers point into
  * the parsed node (struct vless_node), no copies: the node outlives every connection to it. */
 struct tr_node {
+    const char *proto;         /* vless | tt | socks5 | trojan | ss | naive */
+    const char *uuid;          /* secret / user:pass / method:password */
     const char *host;
     uint16_t port;
     const char *type;          /* tcp | grpc | xhttp | ws | httpupgrade */
@@ -99,6 +101,7 @@ struct tr_node {
      * NULL when absent. insecure comes from --insecure, not from the subscription. */
     const char *pcs, *pks, *vcn;
     int insecure;
+    int record_fragment;
     /* security=tls: ECHConfigList in base64 (Xray echConfigList, `ech=` in the link), or NULL. */
     const char *ech;
     /* VLESS encryption: the node's `encryption` string as is (mlkem768x25519plus...), or NULL for
@@ -106,6 +109,11 @@ struct tr_node {
     const char *encryption;
     const char *xhx;
     const char *fm;
+    const char *fp_id;
+    const char *fp_secret;
+    const char *fp_method;
+    uint32_t fp_chunk;
+    uint8_t fp_conc;
     const struct tr_node *dl;
 };
 
@@ -137,6 +145,10 @@ struct grpc_de {
     unsigned char pb[8];         /* protobuf field tag and length */
     unsigned char pb_n;
     uint32_t field_left;         /* bytes left of the bytes field inside the message */
+    uint8_t naive;               /* 1: NaiveProxy 8-frame padding active on stream */
+    uint8_t naive_tx;            /* NaiveProxy padded frames written so far (0..8) */
+    uint8_t naive_rx;            /* NaiveProxy padded frames read so far (0..8) */
+    uint8_t naive_pad_left;      /* unread padding bytes trailing current Naive frame */
 };
 
 /* xhttp mode. It decides how many HTTP requests one connection carries and how they split the
@@ -451,7 +463,7 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 
 /* ---- for the files of this directory ------------------------------------------------------ */
 
-extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
+extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade, tr_tt;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
 int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);

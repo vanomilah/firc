@@ -497,7 +497,7 @@ TEST a_subscription_alone_is_a_source(void) {
 
 /* catches: a non-vless link handed to tunvless */
 TEST a_link_that_is_not_vless_is_refused(void) {
-    ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"vmess://abc\"\n",
+    ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"unkproto://abc\"\n",
                        "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
     PASS();
 }
