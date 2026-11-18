@@ -85,6 +85,7 @@
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
 void tr_venc_test_set_vmess_counts(struct transport *t, uint32_t tx_cnt, uint32_t rx_cnt);
+int tr_fp_live_contexts(void);
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
@@ -1102,6 +1103,176 @@ static int fake_dial2(const char *host, uint16_t port, int timeout_s) {
     if (fd < 0) return TR_ECONNECT;
     sock_ready(fd, timeout_s);
     return fd;
+}
+
+static int g_fp_fds[4] = { -1, -1, -1, -1 };
+static volatile int g_fp_dial_idx;
+static char g_fp_target[128];
+static unsigned char g_fp_uplink[64];
+static volatile size_t g_fp_up_len;
+static volatile int g_fp_up_ready;
+static volatile int g_fp_hdr_ok;
+
+static int fp_mock_dial(const char *host, uint16_t port, int timeout_s) {
+    (void)host; (void)port;
+    int idx = __atomic_fetch_add(&g_fp_dial_idx, 1, __ATOMIC_SEQ_CST);
+    if (idx < 0 || idx >= 4) return TR_ECONNECT;
+    int fd = g_fp_fds[idx];
+    g_fp_fds[idx] = -1;
+    if (fd < 0) return TR_ECONNECT;
+    sock_ready(fd, timeout_s);
+    return fd;
+}
+
+static int fp_mock_read_line(int fd, char *out, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        char c;
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '\r') continue;
+        if (c == '\n') { out[n] = '\0'; return (int)n; }
+        out[n++] = c;
+    }
+    out[n] = '\0';
+    return (int)n;
+}
+
+static int fp_mock_read_exact(int fd, unsigned char *out, size_t need) {
+    size_t got = 0;
+    while (got < need) {
+        ssize_t r = recv(fd, out + got, need - got, 0);
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+static void fp_put_be32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+static void fp_put_be64(unsigned char *p, uint64_t v) {
+    fp_put_be32(p, (uint32_t)(v >> 32));
+    fp_put_be32(p + 4, (uint32_t)v);
+}
+
+static void *fp_mock_srv_link(void *arg) {
+    int fd = *(int *)arg;
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    for (;;) {
+        char line[512];
+        if (fp_mock_read_line(fd, line, sizeof(line)) <= 0) break;
+        long clen = -1;
+        int has_ver = 0, has_auth = 0;
+        for (;;) {
+            int ln = fp_mock_read_line(fd, line, sizeof(line));
+            if (ln < 0) goto out;
+            if (ln == 0) break;
+            if (!strncasecmp(line, "Content-Length:", 15)) clen = strtol(line + 15, NULL, 10);
+            else if (!strncasecmp(line, "X-FP-Version:", 13) && strstr(line + 13, "fp/1")) has_ver = 1;
+            else if (!strncasecmp(line, "X-FP-Auth:", 10) && strstr(line + 10, "s=")) has_auth = 1;
+        }
+        if (clen < 54 || clen > 4096) break;
+        if (has_ver && has_auth) __atomic_store_n(&g_fp_hdr_ok, 1, __ATOMIC_RELEASE);
+
+        unsigned char req[4096];
+        if (fp_mock_read_exact(fd, req, (size_t)clen) != 0) break;
+        if (memcmp(req, "FP01", 4) != 0) break;
+
+        uint8_t op = req[4];
+        uint64_t want_down = ((uint64_t)req[38] << 56) | ((uint64_t)req[39] << 48) |
+                             ((uint64_t)req[40] << 40) | ((uint64_t)req[41] << 32) |
+                             ((uint64_t)req[42] << 24) | ((uint64_t)req[43] << 16) |
+                             ((uint64_t)req[44] << 8)  | (uint64_t)req[45];
+        uint32_t plen = ((uint32_t)req[50] << 24) | ((uint32_t)req[51] << 16) |
+                        ((uint32_t)req[52] << 8)  | (uint32_t)req[53];
+        if (54u + plen != (uint32_t)clen) break;
+
+        unsigned char body[128];
+        memset(body, 0, sizeof(body));
+        memcpy(body, "FP01", 4);
+        body[4] = 0; /* FP_STATUS_OK */
+        memset(body + 6, 0xAA, 16);
+        size_t out_pay = 0;
+
+        if (op == 1) { /* FP_OP_OPEN */
+            size_t tn = plen < sizeof(g_fp_target) - 1 ? plen : sizeof(g_fp_target) - 1;
+            memcpy(g_fp_target, req + 54, tn);
+            g_fp_target[tn] = '\0';
+        } else if (op == 2) { /* FP_OP_UP */
+            if (plen > 0 && plen <= sizeof(g_fp_uplink)) {
+                memcpy(g_fp_uplink, req + 54, plen);
+                __atomic_store_n(&g_fp_up_len, plen, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_fp_up_ready, 1, __ATOMIC_RELEASE);
+            }
+            fp_put_be64(body + 22, plen);
+        } else if (op == 3) { /* FP_OP_DOWN */
+            if (__atomic_load_n(&g_fp_up_ready, __ATOMIC_ACQUIRE) && want_down == 0) {
+                body[5] = 0x01; /* FP_RESP_FLAG_TARGET_EOF */
+                fp_put_be64(body + 30, 0);
+                fp_put_be64(body + 38, 4);
+                fp_put_be64(body + 46, 4);
+                fp_put_be32(body + 54, 4);
+                memcpy(body + 58, "PONG", 4);
+                out_pay = 4;
+            }
+        } else if (op == 4) { /* FP_OP_CLOSE */
+            body[5] = 0x04; /* FP_RESP_FLAG_SESSION_CLOSED */
+        }
+
+        char rhdr[256];
+        int hlen = snprintf(rhdr, sizeof(rhdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Connection: keep-alive\r\n"
+                            "X-FP-Version: fp/1\r\n"
+                            "Content-Length: %zu\r\n\r\n",
+                            58 + out_pay);
+        if (wr_all(fd, (const unsigned char *)rhdr, (size_t)hlen) != 0 ||
+            wr_all(fd, body, 58 + out_pay) != 0)
+            break;
+    }
+out:
+    close(fd);
+    return NULL;
+}
+
+static void *fp_bad_chunk_srv_link(void *arg) {
+    int fd = *(int *)arg;
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char line[512];
+    if (fp_mock_read_line(fd, line, sizeof(line)) > 0) {
+        long clen = -1;
+        for (;;) {
+            int ln = fp_mock_read_line(fd, line, sizeof(line));
+            if (ln <= 0) break;
+            if (!strncasecmp(line, "Content-Length:", 15)) clen = strtol(line + 15, NULL, 10);
+        }
+        if (clen > 0 && clen <= 4096) {
+            unsigned char req[4096];
+            (void)fp_mock_read_exact(fd, req, (size_t)clen);
+        }
+        static const char bad_resp[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n"
+            "X-FP-Version: fp/1\r\n\r\n"
+            "ffffffffffffffff\r\n"
+            "AAAA\r\n0\r\n\r\n";
+        (void)wr_all(fd, (const unsigned char *)bad_resp, sizeof(bad_resp) - 1);
+    }
+    close(fd);
+    return NULL;
 }
 
 /* A Reality node over tcp. Reality, not security=tls: the proof here is the temporary
@@ -3697,6 +3868,163 @@ int main(void) {
         close(sv[1]);
         check("vmess B4: nothing left on the heap", 0, LEAK_CHECK());
     }
+    /* FiniteProto (tr_fp): 1) spare/unused dial closed before transport_write leaks neither
+     * descriptors nor heap; 2) full HTTP/1.1 keep-alive session exchanges VLESS + payload
+     * bidirectionally and tears down all worker threads, descriptors, and heap cleanly. */
+    {
+        struct vless_node fpn;
+        memset(&fpn, 0, sizeof(fpn));
+        snprintf(fpn.proto_str, sizeof(fpn.proto_str), "%s", "vless");
+        snprintf(fpn.host, sizeof(fpn.host), "%s", "fp.invalid");
+        fpn.port = 443;
+        snprintf(fpn.uuid, sizeof(fpn.uuid), "%s", "11111111-2222-3333-4444-555555555555");
+        snprintf(fpn.type, sizeof(fpn.type), "%s", "xhttp");
+        snprintf(fpn.mode, sizeof(fpn.mode), "%s", "finiteproto");
+        snprintf(fpn.security, sizeof(fpn.security), "%s", "none");
+        snprintf(fpn.path, sizeof(fpn.path), "%s", "/cdn-bridge");
+        snprintf(fpn.fp_id, sizeof(fpn.fp_id), "%s", "c1");
+        snprintf(fpn.fp_secret, sizeof(fpn.fp_secret), "%s",
+                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        snprintf(fpn.fp_method, sizeof(fpn.fp_method), "%s", "post");
+
+        int fds0 = fd_count();
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 2;
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&fpn, &c, 3);
+        g_tcp_dial = NULL;
+        check("finiteproto unused dial: vless_connect succeeds", 0, rc);
+        transport_close(&c);
+        close(sv[1]);
+        check("finiteproto unused dial: live contexts back to 0", 0, tr_fp_live_contexts());
+        check("finiteproto unused dial: no leaked descriptors", fds0, fd_count());
+        check("finiteproto unused dial: nothing left on the heap", 0, LEAK_CHECK());
+
+        int sp[2][2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp[0]) != 0) return 2;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp[1]) != 0) {
+            close(sp[0][0]); close(sp[0][1]);
+            return 2;
+        }
+        memset(g_fp_target, 0, sizeof(g_fp_target));
+        memset(g_fp_uplink, 0, sizeof(g_fp_uplink));
+        g_fp_up_len = 0;
+        g_fp_up_ready = 0;
+        g_fp_hdr_ok = 0;
+        g_fp_dial_idx = 0;
+        g_fp_fds[0] = sp[0][0];
+        g_fp_fds[1] = sp[1][0];
+        g_fp_fds[2] = -1;
+        g_fp_fds[3] = -1;
+
+        int srv_fds[2] = { sp[0][1], sp[1][1] };
+        pthread_t sth[2];
+        if (pthread_create(&sth[0], NULL, fp_mock_srv_link, &srv_fds[0]) != 0 ||
+            pthread_create(&sth[1], NULL, fp_mock_srv_link, &srv_fds[1]) != 0) {
+            return 2;
+        }
+
+        g_tcp_dial = fp_mock_dial;
+        rc = vless_connect(&fpn, &c, 3);
+        check("finiteproto session: vless_connect succeeds", 0, rc);
+
+        unsigned char uuid[16];
+        vless_uuid_parse(fpn.uuid, uuid);
+        unsigned char req_buf[128];
+        size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, "example.com", NULL, 0, 443,
+                                           NULL, req_buf, sizeof(req_buf));
+        memcpy(req_buf + req_n, "PING", 4);
+        check("finiteproto session: transport_write VLESS + PING", 0,
+              transport_write(&c, req_buf, req_n + 4));
+
+        unsigned char rx_all[32];
+        size_t rx_have = 0;
+        for (int iter = 0; iter < 50 && rx_have < 6; iter++) {
+            struct pollfd p = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+            if (poll(&p, 1, 200) <= 0) continue;
+            size_t got = 0;
+            int rrc = transport_read(&c, rx_all + rx_have, sizeof(rx_all) - rx_have, &got);
+            if (rrc != 0) break;
+            rx_have += got;
+        }
+        g_tcp_dial = NULL;
+
+        check("finiteproto session: X-FP-Version and X-FP-Auth sent", 1, g_fp_hdr_ok);
+        check_str("finiteproto session: target extracted from VLESS header",
+                  "example.com:443", g_fp_target);
+        check("finiteproto session: uplink payload delivered", 0,
+              g_fp_up_len == 4 ? memcmp(g_fp_uplink, "PING", 4) : -1);
+        check("finiteproto session: VLESS 0x00 0x00 + PONG received", 0,
+              rx_have == 6 ? memcmp(rx_all, "\x00\x00PONG", 6) : -1);
+        check("finiteproto session: HTTP/1.1 keep-alive reused <= 2 links", 1,
+              g_fp_dial_idx <= 2);
+
+        transport_close(&c);
+        for (int i = 0; i < 4; i++) {
+            if (g_fp_fds[i] >= 0) {
+                shutdown(g_fp_fds[i], SHUT_RDWR);
+                close(g_fp_fds[i]);
+                g_fp_fds[i] = -1;
+            }
+        }
+        for (int i = 0; i < 2; i++) {
+            shutdown(srv_fds[i], SHUT_RDWR);
+        }
+        pthread_join(sth[0], NULL);
+        pthread_join(sth[1], NULL);
+        for (int w = 0; w < 100 && tr_fp_live_contexts() > 0; w++) usleep(5000);
+        usleep(5000);
+        check("finiteproto session: live contexts back to 0", 0, tr_fp_live_contexts());
+        check("finiteproto session: no leaked descriptors", fds0, fd_count());
+        check("finiteproto session: nothing left on the heap", 0, LEAK_CHECK());
+
+        /* Regression: 1) overflowing 64-bit chunk size (ffffffffffffffff) rejected cleanly with
+         * immediate EOF and zero heap/fd leak; 2) caller-owned vless_node wiped + freed immediately
+         * after async transport_close causes zero UAF in detached worker (deep-copied tr_node). */
+        int bad_sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, bad_sp) != 0) return 2;
+        g_fp_dial_idx = 0;
+        g_fp_fds[0] = bad_sp[0];
+        g_fp_fds[1] = -1;
+        g_fp_fds[2] = -1;
+        g_fp_fds[3] = -1;
+        int bad_srv_fd = bad_sp[1];
+        pthread_t bad_th;
+        if (pthread_create(&bad_th, NULL, fp_bad_chunk_srv_link, &bad_srv_fd) != 0) return 2;
+
+        struct vless_node *dyn_fpn = malloc(sizeof(*dyn_fpn));
+        if (!dyn_fpn) return 2;
+        *dyn_fpn = fpn;
+
+        g_tcp_dial = fp_mock_dial;
+        rc = vless_connect(dyn_fpn, &c, 3);
+        check("finiteproto bad chunk: vless_connect succeeds", 0, rc);
+        check("finiteproto bad chunk: transport_write starts worker", 0,
+              transport_write(&c, req_buf, req_n + 4));
+
+        /* Immediately poison & free caller vless_node while detached worker is running */
+        memset(dyn_fpn, 0xA5, sizeof(*dyn_fpn));
+        free(dyn_fpn);
+
+        struct pollfd bp = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+        int bpr = poll(&bp, 1, 2000);
+        size_t bgot = 0;
+        unsigned char brx[16];
+        int brc = (bpr > 0) ? transport_read(&c, brx, sizeof(brx), &bgot) : -999;
+        g_tcp_dial = NULL;
+        check("finiteproto bad chunk: worker closes app_fd on overflow chunk", TR_ECLOSED, brc);
+
+        transport_close(&c);
+        pthread_join(bad_th, NULL);
+        for (int w = 0; w < 100 && tr_fp_live_contexts() > 0; w++) usleep(5000);
+        usleep(5000);
+        check("finiteproto bad chunk: live contexts back to 0", 0, tr_fp_live_contexts());
+        check("finiteproto bad chunk: no leaked descriptors", fds0, fd_count());
+        check("finiteproto bad chunk: nothing left on the heap", 0, LEAK_CHECK());
+    }
+
 #if !defined(__SANITIZE_ADDRESS__)
     printf("\nWARNING: built WITHOUT AddressSanitizer: the 'nothing left on the heap' checks\n");
     printf("         are vacuous. Return codes and descriptors are checked, the heap is NOT.\n");

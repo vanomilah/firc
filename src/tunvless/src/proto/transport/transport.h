@@ -356,9 +356,11 @@ struct security_ops {
 
 /* A connection to a node: the main link, the transport over it and its state. xhttp has no main
  * link: it keeps its own connections in xh, which shares the memory of the others. */
+struct fp_ctx;
 struct transport {
     const struct transport_ops *fr;
     struct venc *enc;          /* VLESS encryption over the transport (trvenc.c), or NULL */
+    struct fp_ctx *fp;         /* FiniteProto v2 context, or NULL */
     const char *why;
     union {
         struct {
@@ -463,7 +465,7 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 
 /* ---- for the files of this directory ------------------------------------------------------ */
 
-extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade, tr_tt;
+extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade, tr_tt, tr_fp;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
 int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);

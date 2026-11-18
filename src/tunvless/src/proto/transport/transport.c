@@ -158,8 +158,12 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
         t->link.fd = -1;
         return TR_ENONODE;
     }
-    int is_h2_connect = n->proto && (!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive"));
-    t->fr = is_h2_connect ? &tr_tt : transport_of(n->type);
+    if (n->mode && !strcmp(n->mode, "finiteproto")) {
+        t->fr = &tr_fp;
+    } else {
+        int is_h2_connect = n->proto && (!strcmp(n->proto, "tt") || !strcmp(n->proto, "naive"));
+        t->fr = is_h2_connect ? &tr_tt : transport_of(n->type);
+    }
     memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
     if (!own_links(t)) t->link.fd = -1;
     int rc = t->fr->dial ? t->fr->dial(t, n, timeout_s) : tr_link_open(&t->link, n, t->fr->alpn, timeout_s);
