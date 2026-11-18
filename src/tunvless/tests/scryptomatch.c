@@ -365,6 +365,50 @@ static void test_proxy_prims(void) {
     check_mem("AES-256 block decrypts back", pt, back, 16);
     check("AES block: 24-byte key rejected", SC_EINVAL, sc_aes_block(key, 24, 0, pt, ct));
 
+    /* PBKDF2-HMAC-SHA256 (RFC 7914 §11: P="passwd", S="salt", c=1 and c=2, dkLen=64). */
+    check("PBKDF2-SHA256 c=1: return code", 0, sc_pbkdf2_sha256("passwd", 6, "salt", 4, 1, out, 64));
+    check_bytes("PBKDF2-SHA256 RFC 7914 c=1",
+                "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+                "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783", out, 64);
+
+    /* XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03 §A.3.1). */
+    {
+        unsigned char xk[32], xn[24], xp[128], xa[16], xtag[16];
+        unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f", xk, 32);
+        unhex("404142434445464748494a4b4c4d4e4f5051525354555657", xn, 24);
+        size_t xpn = unhex("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920"
+                           "636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c207375"
+                           "6e73637265656e20776f756c642062652069742e", xp, sizeof xp);
+        size_t xan = unhex("50515253c0c1c2c3c4c5c6c7", xa, sizeof xa);
+        memcpy(buf, xp, xpn);
+        check("XChaCha20-Poly1305 seal: return code", 0, sc_xchacha20_poly1305_seal(xk, xn, xa, xan, buf, xpn, xtag));
+        check_bytes("XChaCha20-Poly1305 §A.3.1 ciphertext",
+                    "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39"
+                    "ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9"
+                    "21f9664c97637da9768812f615c68b13b52e", buf, xpn);
+        check_bytes("XChaCha20-Poly1305 §A.3.1 tag", "c0875924c1c7987947deafd8780acf49", xtag, 16);
+        check("XChaCha20-Poly1305 open: return code", 0, sc_xchacha20_poly1305_open(xk, xn, xa, xan, buf, xpn, xtag));
+        check_mem("XChaCha20-Poly1305 plaintext restored", xp, buf, xpn);
+    }
+
+    /* ChaCha20 QUIC header protection (RFC 9001 §A.5). */
+    {
+        unsigned char hpk[32], hps[16], hpm[5];
+        unhex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4", hpk, 32);
+        unhex("5e5cd55c41f69080575d7999c25a5bfb", hps, 16);
+        check("ChaCha20 HP RFC 9001 §A.5: return code", 0, sc_chacha20_hp(hpk, hps, hpm));
+        check_bytes("ChaCha20 HP RFC 9001 §A.5 mask", "aefefe7d03", hpm, 5);
+    }
+
+    /* BLAKE2b-256 (RFC 7693 / standard vectors). */
+    {
+        sc_blake2b_256(out, "", 0);
+        check_bytes("BLAKE2b-256(empty)",
+                    "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8", out, 32);
+        sc_blake2b_256(out, "abc", 3);
+        check_bytes("BLAKE2b-256(abc)",
+                    "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319", out, 32);
+    }
 }
 
 /* ---- X25519 ---------------------------------------------------------------------------------- */

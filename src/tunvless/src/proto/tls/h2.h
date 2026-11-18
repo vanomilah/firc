@@ -121,6 +121,11 @@ struct h2 {
  * H2_ETOOBIG on a perfectly legal frame. */
 #define H2_MIN_READ_CAP (16384 + 16)
 
+/* Opens a stream with an HTTP/2 CONNECT request (RFC 7540 §8.3): :method = CONNECT and
+ * :authority = authority, without :scheme or :path. */
+int h2_start_connect(struct h2 *h, const struct h2_io *io, const char *authority,
+                     const char *proxy_auth, const char *user_agent, int end_stream);
+
 /* Opens a stream with the gRPC headers: preface, SETTINGS, WINDOW_UPDATE, HEADERS. content_type
  * and referer may be NULL; gRPC sends no referer. */
 int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
