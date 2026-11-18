@@ -367,13 +367,18 @@ static firc_err_t parse_source(ctx_t *c, node_t *item, size_t ti, size_t i, firc
             return fail(c, "key given twice", "tunnels[%zu].sources[%zu]", ti, i);
         }
         if (strcmp(text(k), "id") == 0) {
-            if (!copy_str(v, src->id, sizeof src->id) || !hex8_ok(src->id)) {
+            if (is_scalar(v) && text(v)[0] == '\0') {
+                src->id[0] = '\0';
+            } else if (!copy_str(v, src->id, sizeof src->id) || !hex8_ok(src->id)) {
                 return fail(c, "8 hex digits, 0-9 and a-f", "tunnels[%zu].sources[%zu].id", ti, i);
             }
         } else if (strcmp(text(k), "link") == 0) {
             link = v;
         } else if (strcmp(text(k), "subscription") == 0) {
             sub = v;
+        } else if (strcmp(text(k), "kind") == 0 || strcmp(text(k), "name") == 0 ||
+                   strcmp(text(k), "enabled") == 0) {
+            continue;
         } else {
             return fail(c, shape, "tunnels[%zu].sources[%zu]", ti, i);
         }
@@ -386,7 +391,7 @@ static firc_err_t parse_source(ctx_t *c, node_t *item, size_t ti, size_t i, firc
         return parse_sub(c, sub, ti, i, &src->sub);
     }
     if (!is_scalar(link) || !link_ok(text(link))) {
-        return fail(c, "must be one vless://, hysteria2:// or hy2:// link without whitespace", "tunnels[%zu].sources[%zu]", ti, i);
+        return fail(c, "must be one proxy link without whitespace", "tunnels[%zu].sources[%zu]", ti, i);
     }
     src->kind = FIRC_TUN_SRC_LINK;
     src->link = strdup(text(link));
@@ -939,6 +944,9 @@ static firc_err_t load_doc(ctx_t *c, firc_tunnels_t *out)
     node_t *list = NULL;
     for (yaml_node_pair_t *p = root->data.mapping.pairs.start; p < root->data.mapping.pairs.top; p++) {
         node_t *k = at(c, p->key);
+        if (is_scalar(k) && strcmp(text(k), "configVersion") == 0) {
+            continue;
+        }
         if (!is_scalar(k) || strcmp(text(k), "tunnels") != 0) {
             return fail(c, "unknown key", "tunnels.yaml");
         }

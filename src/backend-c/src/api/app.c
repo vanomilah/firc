@@ -4146,7 +4146,7 @@ static void autolist_probed(firc_app_t *app, const char *host, bool by_domain, c
         if (!firc_regdomain(host, domain, sizeof(domain))) { return; }
         firc_al_cand_t *c = firc_al_cands_find(app->al_cands, domain);
         if (c == NULL || c->state != FIRC_AL_CHECKING) { return; }
-        if (c->fails > 0) {
+        if (c->fails > 0 || (r->verdict == FIRC_AUTOLIST_REACHABLE && r->short_body && c->why == FIRC_AL_WHY_FREEZE)) {
             c->state = FIRC_AL_CAND;
         } else {
             (void)firc_al_cands_forget(app->al_cands, domain);

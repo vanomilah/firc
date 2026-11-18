@@ -261,8 +261,12 @@ static cJSON *shape_source(const cJSON *v)
     cJSON *o = cJSON_CreateObject();
     cJSON *sub = NULL;
     const cJSON *kind = cJSON_GetObjectItemCaseSensitive(v, "kind");
-    bool is_sub = cJSON_IsString(kind) && strcmp(kind->valuestring, "subscription") == 0;
-    bool is_link = cJSON_IsString(kind) && strcmp(kind->valuestring, "link") == 0;
+    const cJSON *link_item = cJSON_GetObjectItemCaseSensitive(v, "link");
+    const cJSON *url_item = cJSON_GetObjectItemCaseSensitive(v, "url");
+    bool is_sub = (cJSON_IsString(kind) && strcmp(kind->valuestring, "subscription") == 0) ||
+                  (kind == NULL && cJSON_IsString(url_item) && url_item->valuestring[0] != '\0');
+    bool is_link = (cJSON_IsString(kind) && strcmp(kind->valuestring, "link") == 0) ||
+                   (!is_sub && cJSON_IsString(link_item) && link_item->valuestring[0] != '\0');
     if (is_sub) {
         sub = cJSON_CreateObject();
     }
@@ -274,6 +278,16 @@ static cJSON *shape_source(const cJSON *v)
             break;
         }
         if (cJSON_IsNull(it) || strcmp(it->string, "kind") == 0) {
+            continue;
+        }
+        if (strcmp(it->string, "id") == 0 && cJSON_IsString(it) && it->valuestring[0] == '\0') {
+            continue;
+        }
+        if (is_link && (strcmp(it->string, "name") == 0 || strcmp(it->string, "url") == 0 ||
+                        strcmp(it->string, "interval") == 0 || strcmp(it->string, "headers") == 0)) {
+            continue;
+        }
+        if (is_sub && strcmp(it->string, "link") == 0) {
             continue;
         }
         bool sub_field = is_sub && (strcmp(it->string, "name") == 0 || strcmp(it->string, "url") == 0 ||

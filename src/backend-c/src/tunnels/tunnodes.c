@@ -223,6 +223,18 @@ static void on_node(void *ud, const struct vless_node *n, const char *reason)
 
 static void parse_link(build_t *b, const firc_tun_src_t *src)
 {
+    if ((strncmp(src->link, "tt://", 5) == 0 && strchr(src->link, '@') == NULL) ||
+        strncmp(src->link, "http://", 7) == 0 || strncmp(src->link, "https://", 8) == 0) {
+        struct vless_node nodes[16];
+        memset(nodes, 0, sizeof nodes);
+        size_t cnt = vless_parse_sub(src->link, nodes, 16, NULL);
+        if (cnt > 1) {
+            for (size_t i = 0; i < cnt && b->err == FIRC_OK; i++) {
+                add_node(b, src, &nodes[i], i);
+            }
+            return;
+        }
+    }
     struct vless_node n;
     memset(&n, 0, sizeof n);
     int r = vless_parse_url(src->link, &n);
@@ -232,6 +244,7 @@ static void parse_link(build_t *b, const firc_tun_src_t *src)
         add_skipped(b, src, r > 0 ? n.name : "", r > 0 ? n.skip_reason : "cannot parse the link", 0);
     }
 }
+
 
 static const firc_tun_body_t *find_body(const firc_tun_body_t *bodies, size_t n, const char *url, uint32_t mark,
                                         uint64_t hsig)

@@ -3411,6 +3411,7 @@ TEST a_save_that_lost_one_race_drops_nothing(void) {
     for (uint8_t t = 1; t <= 3; t++) { arr[t - 1] = activation_group(t, names[t - 1], NULL, NULL); }
     size_t calls = firc_fake_ipt_attempts(l.fake);
     firc_app_nf_enter(l.app);
+    started = firc_app_nf_passes_for_test(l.app);
     firc_fake_ipt_reset(l.fake);
     firc_fake_ipt_refuse_rules_containing(l.fake, mark);
     firc_err_t err = firc_app_replace_groups(l.app, arr, 3);
@@ -3428,9 +3429,7 @@ TEST a_save_that_lost_one_race_drops_nothing(void) {
     ASSERT_FALSEm("and group 2's rules, refused, are not in the kernel", strstr(mangle, mark) != NULL);
     free(mangle);
 
-    for (int i = 0; i < 500 && !(group_fully_in(&l, (firc_id_t){{1, 1, 1, 1}}) && group_fully_in(&l, (firc_id_t){{3, 3, 3, 3}})); i++) {
-        sleep_ms(10);
-    }
+    ASSERT(wait_written_after(&l, started));
     ASSERT(group_fully_in(&l, (firc_id_t){{1, 1, 1, 1}}));
     ASSERT(group_fully_in(&l, (firc_id_t){{3, 3, 3, 3}}));
     ASSERT_EQ_FMT(0, group_in_kernel(&l, (firc_id_t){{2, 2, 2, 2}}), "%d");
@@ -7607,14 +7606,11 @@ TEST ports_change_requests_a_pass(void) {
     firc_app_nf_enter(l.app);
     ASSERT_EQ_FMT(change, firc_app_nf_change_for_test(l.app), "%" PRIu64);
     firc_app_nf_leave(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
     ports[3] = 3603;
     set_ports(l.app, ports);
-    bool there = false;
-    for (int i = 0; i < 500 && !there; i++) {
-        there = redir_there(&l);
-        if (!there) { sleep_ms(10); }
-    }
-    ASSERT(there);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(redir_there(&l));
     locked_app_down(&l);
     PASS();
 }

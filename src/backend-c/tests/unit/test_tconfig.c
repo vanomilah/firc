@@ -495,10 +495,10 @@ TEST a_subscription_alone_is_a_source(void) {
     PASS();
 }
 
-/* catches: a non-vless link handed to tunvless */
+/* catches: an unsupported link scheme handed to tunvless */
 TEST a_link_that_is_not_vless_is_refused(void) {
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"unkproto://abc\"\n",
-                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
+                       "tunnels[0].sources[0]", "proxy link"));
     PASS();
 }
 
@@ -514,16 +514,16 @@ TEST a_hysteria2_link_is_a_source(void) {
     ASSERT_STR_EQ("hy2://pw@h#A", t.t[0].src[1].link);
     firc_tunnels_free(&t);
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"hysteria2://\"\n",
-                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
+                       "tunnels[0].sources[0]", "proxy link"));
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"hysteria2://p w@h\"\n",
-                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
+                       "tunnels[0].sources[0]", "proxy link"));
     PASS();
 }
 
 /* catches: a link with a newline that would split into two stdin lines */
 TEST a_link_with_a_newline_is_refused(void) {
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site",
-                       "      - link: \"vless://u@h:443\\nvless://x\"\n", "tunnels[0].sources[0]", "vless://"));
+                       "      - link: \"vless://u@h:443\\nvless://x\"\n", "tunnels[0].sources[0]", "proxy link"));
     PASS();
 }
 
@@ -755,7 +755,7 @@ static void n_tunnels(char *doc, size_t cap, int n)
     snprintf(doc, cap, "tunnels:\n");
     for (int i = 0; i < n; i++) {
         char id[8], dev[16];
-        snprintf(id, sizeof id, "t%d", i);
+        snprintf(id, sizeof id, "t%02d", i);
         snprintf(dev, sizeof dev, "tunvless%d", i);
         tun_text(doc + strlen(doc), cap - strlen(doc), id, dev, "auto", "1", "site", LINK);
     }
